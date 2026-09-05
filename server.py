@@ -59,6 +59,7 @@ def create_interface():
     from modules import (
         training,
         ui,
+        ui_benchmarks,
         ui_chat,
         ui_default,
         ui_file_saving,
@@ -188,6 +189,7 @@ def create_interface():
         ui_chat.create_character_settings_ui()  # Character tab
         ui_model_menu.create_ui()  # Model tab
         ui_performance.create_ui()  # Performance tab
+        ui_benchmarks.create_ui()  # Capability benchmarks tab
         if not shared.args.portable:
             ui_image_generation.create_ui()  # Image generation tab
             training.create_ui()  # Training tab

@@ -86,6 +86,30 @@ input[type="number"] {
     -moz-appearance: textfield;
 }
 
+/* Capability benchmarks */
+#benchmarks-tab { padding: 24px; }
+.bench-report, .bench-empty {
+    border: 1px solid var(--border); border-radius: 16px;
+    padding: 22px; background: var(--bg-elevated); color: var(--text);
+}
+.bench-report h2 { margin: 0 0 8px; font-size: 1.3rem; }
+.bench-report p, .bench-environment { color: var(--text-muted); font-size: .85rem; overflow-wrap: anywhere; }
+.bench-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 20px 0; }
+.bench-stat { padding: 12px; border-radius: 10px; background: var(--bg-input); }
+.bench-stat span { display: block; color: var(--text-muted); font-size: .75rem; }
+.bench-stat strong { display: block; margin-top: 5px; font-size: 1.1rem; overflow-wrap: anywhere; }
+.bench-report progress { accent-color: var(--accent); width: 100%; height: 9px; }
+.bench-report table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+.bench-report th, .bench-report td { text-align: left; padding: 12px 8px; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.bench-report td progress { display: block; margin-top: 6px; }
+.bench-protocol { margin-top: 20px; line-height: 1.6; }
+.bench-console { margin-top: 12px; color: var(--text-muted); }
+.bench-console pre { max-height: 200px; overflow: auto; white-space: pre-wrap; font-size: .75rem; }
+@media (max-width: 700px) {
+    #benchmarks-tab { padding: 12px; }
+    .bench-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
 /* Performance dashboard */
 #performance-dashboard {
     width: 100%;
