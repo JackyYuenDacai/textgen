@@ -84,6 +84,8 @@ group.add_argument('--cache-type', '--cache_type', type=str, default='fp16', met
 group = parser.add_argument_group('Speculative decoding')
 group.add_argument('--model-draft', type=str, default=None, help='Path to the draft model for speculative decoding.')
 group.add_argument('--draft-max', type=int, default=3, help='Number of tokens to draft for speculative decoding.')
+group.add_argument('--exl3-dynamic-draft', action='store_true', help='ExLlamaV3: adapt draft length using calibrated acceptance confidence. Requires a draft model or built-in MTP head.')
+group.add_argument('--exl3-draft-confidence', type=float, default=0.4, help='ExLlamaV3 adaptive drafting acceptance target, strictly between 0 and 1. Higher values shorten drafts more aggressively.')
 group.add_argument('--gpu-layers-draft', type=int, default=256, help='Number of layers to offload to the GPU for the draft model.')
 group.add_argument('--device-draft', type=str, default=None, help='Comma-separated list of devices to use for offloading the draft model. Example: CUDA0,CUDA1')
 group.add_argument('--ctx-size-draft', type=int, default=0, help='Size of the prompt context for the draft model. If 0, uses the same as the main model.')

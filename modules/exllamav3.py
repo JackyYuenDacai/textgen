@@ -28,6 +28,7 @@ from exllamav3.generator.sampler import (
 )
 from modules import shared
 from modules.exllamav3_cache import ImageEmbeddingCache
+from modules.exllamav3_drafting import drafting_options
 from modules.image_utils import (
     convert_image_attachments_to_pil,
     convert_openai_messages_to_images
@@ -150,6 +151,7 @@ class Exllamav3Model:
     def from_pretrained(cls, path_to_model):
         path_to_model = Path(f'{shared.args.model_dir}') / Path(path_to_model)
         layer_type, cache_kwargs = cls._cache_settings(shared.args.cache_type)
+        adaptive_options = drafting_options(shared.args, Generator)
         chunk_size = int(shared.args.exl3_max_chunk_size)
         if chunk_size < 256 or chunk_size % 256:
             raise ValueError('exl3-max-chunk-size must be a positive multiple of 256.')
@@ -247,6 +249,8 @@ class Exllamav3Model:
         # zero causes DFlash verification to fail with a recurrent_state shape
         # mismatch. See the upstream ExLlamaV3 generator example.
         max_history = shared.args.draft_max if draft_model is not None else 0
+        if adaptive_options and draft_model is None:
+            logger.warning('Adaptive drafting requested without a draft model or enabled MTP head; it will be inactive.')
         recurrent_drafting = draft_model is not None and model.caps.get("recurrent_states")
         max_batch_size = 1 if recurrent_drafting else 16
         if recurrent_drafting:
@@ -276,6 +280,7 @@ class Exllamav3Model:
             draft_cache=draft_cache,
             num_draft_tokens=shared.args.draft_max if draft_model is not None else 0,
             max_chunk_size=chunk_size,
+            **adaptive_options,
         )
 
         result = cls()
@@ -289,6 +294,13 @@ class Exllamav3Model:
         result.vision_model = vision_model
         result.draft_model = draft_model
         result.draft_cache = draft_cache
+        result.drafting_info = {
+            'mode': 'mtp' if use_mtp_draft else ('external' if draft_model is not None else 'none'),
+            'max_tokens': generator.num_draft_tokens,
+            'adaptive': bool(getattr(generator, 'dynamic_draft', False) and draft_model is not None),
+            'confidence': shared.args.exl3_draft_confidence if adaptive_options else None,
+        }
+        logger.info(f'ExLlamaV3 drafting: {result.drafting_info}')
 
         return result, result
 
@@ -556,6 +568,7 @@ class Exllamav3Model:
         with self.performance_lock:
             recent = [dict(item) for item in self.performance_history]
         return {'recent_requests': recent, 'image_cache': self.image_cache.info(),
+                'drafting': dict(getattr(self, 'drafting_info', {})),
                 'max_chunk_size': self.generator.max_chunk_size if self.generator else None}
 
     def _capture_logprobs(self, result):

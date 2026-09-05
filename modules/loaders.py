@@ -64,6 +64,8 @@ loaders_and_params = OrderedDict({
         'ctx_size',
         'exl3_image_cache_mib',
         'exl3_max_chunk_size',
+        'exl3_dynamic_draft',
+        'exl3_draft_confidence',
         'cache_type',
         'gpu_split',
         'draft_model_header',
@@ -346,6 +348,8 @@ def list_model_elements():
         'spec_ngram_size_m',
         'spec_ngram_min_hits',
         'mmproj',
+        'exl3_dynamic_draft',
+        'exl3_draft_confidence',
     ]
 
     from modules import shared

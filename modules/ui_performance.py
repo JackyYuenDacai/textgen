@@ -258,12 +258,20 @@ def render_performance_dashboard():
     if cache_bytes is not None and cache_max:
         cache_detail += f' · {cache_bytes / 1024 / 1024:.1f}/{cache_max / 1024 / 1024:.0f} MiB'
 
+    drafting = performance.get('drafting') or {}
+    draft_detail = f"job #{latest_completed.get('job_id', '—')}"
+    if drafting.get('mode') and drafting['mode'] != 'none':
+        strategy = 'adaptive' if drafting.get('adaptive') else 'fixed'
+        draft_detail = f"{drafting['mode']} · {strategy} · max {drafting.get('max_tokens', '—')}"
+        if drafting.get('adaptive'):
+            draft_detail += f" · target {_format_percent(drafting.get('confidence'))}"
+
     cards = ''.join([
         _metric_card('Decode speed', _format_number(_rate(latest_completed), suffix=' tok/s'), 'Backend token generation', 'blue'),
         _metric_card('End-to-end', _format_number(_rate(latest_completed, 'end_to_end'), suffix=' tok/s'), 'Includes request latency', 'green'),
         _metric_card('Time to first output', _format_number(latest_completed.get('time_to_first_output'), 3, 's'), 'Queue + prefill + first decode', 'orange'),
         _metric_card('Prompt cache', f"{_format_integer(latest_completed.get('cached_tokens'))} tokens", f"of {_format_integer(latest_completed.get('prompt_tokens'))} prompt tokens", 'violet'),
-        _metric_card('Draft acceptance', _format_percent(latest_completed.get('draft_acceptance')), f"job #{latest_completed.get('job_id', '—')}", 'pink'),
+        _metric_card('Draft acceptance', _format_percent(latest_completed.get('draft_acceptance')), draft_detail, 'pink'),
         _metric_card('Image cache', _format_integer(cache.get('entries')), cache_detail, 'cyan'),
     ])
 

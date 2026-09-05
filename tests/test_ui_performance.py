@@ -33,6 +33,7 @@ class PerformanceDashboardTests(unittest.TestCase):
             ],
             'image_cache': {'entries': 2, 'bytes': 1048576, 'max_bytes': 4194304},
             'max_chunk_size': 2048,
+            'drafting': {'mode': 'mtp', 'adaptive': True, 'max_tokens': 5, 'confidence': 0.4},
         }
         model = SimpleNamespace(get_performance_stats=lambda: stats)
         with patch.object(ui_performance.shared, 'model', model), \
@@ -44,6 +45,7 @@ class PerformanceDashboardTests(unittest.TestCase):
         self.assertIn('80.00 tok/s', output)
         self.assertIn('50.00 tok/s', output)
         self.assertIn('75.0%', output)
+        self.assertIn('mtp · adaptive · max 5 · target 40.0%', output)
         self.assertIn('Throughput trend', output)
         self.assertIn('Latency by job', output)
         self.assertIn('perf-status-stopped', output)
