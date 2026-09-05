@@ -66,6 +66,7 @@ def create_interface():
         ui_model_menu,
         ui_notebook,
         ui_parameters,
+        ui_performance,
         ui_session,
     )
     from modules.chat import generate_pfp_cache
@@ -186,6 +187,7 @@ def create_interface():
         ui_parameters.create_ui()  # Parameters tab
         ui_chat.create_character_settings_ui()  # Character tab
         ui_model_menu.create_ui()  # Model tab
+        ui_performance.create_ui()  # Performance tab
         if not shared.args.portable:
             ui_image_generation.create_ui()  # Image generation tab
             training.create_ui()  # Training tab

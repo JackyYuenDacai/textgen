@@ -263,6 +263,8 @@ class LogitsResponse(BaseModel):
 class ModelInfoResponse(BaseModel):
     model_name: str
     lora_names: List[str]
+    loader: str | None = None
+    performance: dict | None = None
 
 
 class ModelListResponse(BaseModel):

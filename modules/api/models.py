@@ -7,11 +7,14 @@ from modules.utils import get_available_loras, get_available_models
 
 
 def get_current_model_info():
-    return {
+    info = {
         'model_name': shared.model_name,
         'lora_names': shared.lora_names,
         'loader': shared.args.loader
     }
+    if shared.model is not None and hasattr(shared.model, 'get_performance_stats'):
+        info['performance'] = shared.model.get_performance_stats()
+    return info
 
 
 def list_models():

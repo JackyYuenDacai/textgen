@@ -1,6 +1,10 @@
+import json
 import math
 import queue
+import re
 import threading
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any, List, Tuple
 
@@ -23,6 +27,7 @@ from exllamav3.generator.sampler import (
     SS_TopP
 )
 from modules import shared
+from modules.exllamav3_cache import ImageEmbeddingCache
 from modules.image_utils import (
     convert_image_attachments_to_pil,
     convert_openai_messages_to_images
@@ -119,6 +124,24 @@ class ConcurrentGenerator:
 
 class Exllamav3Model:
 
+    def __init__(self):
+        self.image_cache = ImageEmbeddingCache(shared.args.exl3_image_cache_mib * 1024**2)
+        self.performance_history = deque(maxlen=32)
+        self.performance_lock = threading.Lock()
+
+    @staticmethod
+    def _cache_settings(cache_type):
+        cache_type = cache_type.lower()
+        if cache_type == 'fp16':
+            return CacheLayer_fp16, {}
+        match = re.fullmatch(r'q([2-8])(?:_q([2-8]))?', cache_type)
+        if match:
+            return CacheLayer_quant, {'k_bits': int(match[1]), 'v_bits': int(match[2] or match[1])}
+        raise ValueError(
+            f"Unsupported ExLlamaV3 cache type: {cache_type!r}. Use fp16, q2 through q8, "
+            "or a combination such as q4_q8. This loader does not support fp8 or nvfp4."
+        )
+
     @property
     def device(self) -> torch.device:
         return torch.device(0)
@@ -126,6 +149,12 @@ class Exllamav3Model:
     @classmethod
     def from_pretrained(cls, path_to_model):
         path_to_model = Path(f'{shared.args.model_dir}') / Path(path_to_model)
+        layer_type, cache_kwargs = cls._cache_settings(shared.args.cache_type)
+        chunk_size = int(shared.args.exl3_max_chunk_size)
+        if chunk_size < 256 or chunk_size % 256:
+            raise ValueError('exl3-max-chunk-size must be a positive multiple of 256.')
+        if shared.args.exl3_image_cache_mib < 0:
+            raise ValueError('exl3-image-cache-mib must be nonnegative.')
 
         # Reset global MMTokenAllocator to prevent token ID corruption when switching models
         from exllamav3.tokenizer.mm_embedding import (
@@ -144,34 +173,7 @@ class Exllamav3Model:
             logger.warning(f"max_num_tokens must be a multiple of 256. Adjusting from {max_tokens} to {adjusted_tokens}")
             max_tokens = adjusted_tokens
 
-        cache_type = shared.args.cache_type.lower()
-        cache_kwargs = {}
-        if cache_type == 'fp16':
-            layer_type = CacheLayer_fp16
-        elif cache_type.startswith('q'):
-            layer_type = CacheLayer_quant
-            if '_' in cache_type:
-                # Different bits for k and v (e.g., q4_q8)
-                k_part, v_part = cache_type.split('_')
-                k_bits = int(k_part[1:])
-                v_bits = int(v_part[1:])
-            else:
-                # Same bits for k and v (e.g., q4)
-                k_bits = v_bits = int(cache_type[1:])
-
-            # Validate bit ranges
-            if not (2 <= k_bits <= 8 and 2 <= v_bits <= 8):
-                logger.warning(f"Invalid quantization bits: k_bits={k_bits}, v_bits={v_bits}. Must be between 2 and 8. Falling back to fp16.")
-                layer_type = CacheLayer_fp16
-            else:
-                cache_kwargs = {'k_bits': k_bits, 'v_bits': v_bits}
-        else:
-            logger.warning(f"Unrecognized cache type: {cache_type}. Falling back to fp16.")
-            layer_type = CacheLayer_fp16
-
-        cache = Cache(model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
-
-        load_params = {'progressbar': True}
+        load_params = {'progressbar': True, 'max_chunk_size': chunk_size}
         split = None
         if shared.args.gpu_split:
             split = [float(alloc) for alloc in shared.args.gpu_split.split(",")]
@@ -201,7 +203,21 @@ class Exllamav3Model:
         # Initialize draft model for speculative decoding
         draft_model = None
         draft_cache = None
-        if shared.args.model_draft and shared.args.model_draft.lower() not in ["", "none"]:
+        use_mtp_draft = (
+            shared.args.spec_type == 'draft-mtp'
+            and 'mtp' in config.model_classes
+            and not (shared.args.model_draft and shared.args.model_draft.lower() not in ["", "none"])
+        )
+        if use_mtp_draft:
+            logger.info("Using built-in MTP head as speculative draft model.")
+            draft_model = Model.from_config(config, component="mtp")
+            draft_cache = Cache(draft_model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
+            draft_load_params = {'progressbar': True, 'max_chunk_size': chunk_size}
+            if split:
+                draft_load_params['use_per_device'] = split
+            draft_model.load(**draft_load_params)
+            logger.info(f"MTP draft model loaded. Max speculative tokens: {shared.args.draft_max}")
+        elif shared.args.model_draft and shared.args.model_draft.lower() not in ["", "none"]:
             logger.info(f"Loading draft model for speculative decoding: {shared.args.model_draft}")
 
             draft_path = Path(shared.args.model_draft)
@@ -213,14 +229,40 @@ class Exllamav3Model:
             else:
                 draft_config = Config.from_directory(str(draft_path))
                 draft_model = Model.from_config(draft_config)
+                required_draft_size = draft_model.caps.get('required_draft_size')
+                if required_draft_size is not None and shared.args.draft_max != required_draft_size:
+                    logger.warning(f"Draft model requires {required_draft_size} draft tokens; adjusting draft-max.")
+                    shared.args.draft_max = required_draft_size
                 draft_cache = Cache(draft_model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
 
-                draft_load_params = {'progressbar': True}
+                draft_load_params = {'progressbar': True, 'max_chunk_size': chunk_size}
                 if split:
                     draft_load_params['use_per_device'] = split
 
                 draft_model.load(**draft_load_params)
                 logger.info(f"Draft model loaded successfully. Max speculative tokens: {shared.args.draft_max}")
+
+        # Recurrent target models need one rollback-history slot per speculative
+        # token. This must be set when the cache is constructed; the default of
+        # zero causes DFlash verification to fail with a recurrent_state shape
+        # mismatch. See the upstream ExLlamaV3 generator example.
+        max_history = shared.args.draft_max if draft_model is not None else 0
+        recurrent_drafting = draft_model is not None and model.caps.get("recurrent_states")
+        max_batch_size = 1 if recurrent_drafting else 16
+        if recurrent_drafting:
+            logger.info(
+                f"Recurrent speculative decoding enabled: reserving {max_history} "
+                "history states for one concurrent sequence."
+            )
+
+        cache = Cache(
+            model,
+            max_num_tokens=max_tokens,
+            max_batch_size=max_batch_size,
+            max_history=max_history,
+            layer_type=layer_type,
+            **cache_kwargs,
+        )
 
         # Load main model last
         model.load(**load_params)
@@ -233,6 +275,7 @@ class Exllamav3Model:
             draft_model=draft_model,
             draft_cache=draft_cache,
             num_draft_tokens=shared.args.draft_max if draft_model is not None else 0,
+            max_chunk_size=chunk_size,
         )
 
         result = cls()
@@ -253,7 +296,7 @@ class Exllamav3Model:
         """Check if this model supports multimodal input."""
         return hasattr(self, 'vision_model') and self.vision_model is not None
 
-    def _process_images_for_generation(self, prompt: str, state: dict) -> Tuple[str, List[Any]]:
+    def _process_images_for_generation(self, prompt: str, state: dict, metrics=None) -> Tuple[str, List[Any]]:
         """
         Process all possible image inputs and return modified prompt + embeddings.
         Returns: (processed_prompt, image_embeddings)
@@ -279,11 +322,20 @@ class Exllamav3Model:
                 image_embeddings = state['image_embeddings']
             else:
                 # Do not reset the cache/allocator index; it causes token ID conflicts during generation.
-                logger.info(f"Processing {len(pil_images)} image(s) with ExLlamaV3 vision model")
-                image_embeddings = [
-                    self.vision_model.get_image_embeddings(tokenizer=self.tokenizer, image=img)
-                    for img in pil_images
-                ]
+                pp = getattr(self.vision_model.config, 'vision_pp', None)
+                processing_key = (id(self.vision_model), json.dumps(vars(pp) if pp else {}, sort_keys=True, default=str))
+                image_embeddings = []
+                hits = 0
+                for img in pil_images:
+                    embedding, hit = self.image_cache.get_or_create(
+                        img, processing_key,
+                        lambda: self.vision_model.get_image_embeddings(tokenizer=self.tokenizer, image=img),
+                    )
+                    image_embeddings.append(embedding)
+                    hits += hit
+                logger.info(f"ExLlamaV3 images: {hits} reused, {len(pil_images) - hits} encoded")
+                if metrics is not None:
+                    metrics.update(image_cache_hits=hits, image_cache_misses=len(pil_images) - hits)
 
             placeholders = [ie.text_alias for ie in image_embeddings]
 
@@ -309,11 +361,14 @@ class Exllamav3Model:
         Generate text with streaming using native ExLlamaV3 API
         """
 
+        request_start = time.perf_counter()
+        metrics = {'image_cache_hits': 0, 'image_cache_misses': 0}
         if shared.is_multimodal:
             # Process images and modify prompt (ExLlamaV3-specific)
-            prompt, image_embeddings = self._process_images_for_generation(prompt, state)
+            prompt, image_embeddings = self._process_images_for_generation(prompt, state, metrics)
         else:
             image_embeddings = []
+        metrics['image_seconds'] = time.perf_counter() - request_start
 
         # Greedy decoding is a special case
         if state['temperature'] == 0:
@@ -431,6 +486,9 @@ class Exllamav3Model:
         self.last_completion_token_count = 0
 
         result_queue = self.parallel_generator.submit(job)
+        final_result = None
+        emitted_tokens = 0
+        first_output_time = None
         try:
             while True:
                 if shared.stop_everything or (stop_event and stop_event.is_set()):
@@ -439,23 +497,66 @@ class Exllamav3Model:
                     result = result_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                if result is None or result.get("eos"):
-                    if result is not None and return_top_tokens > 0:
-                        self._capture_logprobs(result)
+                if result is None:
                     break
+                if result.get('eos'):
+                    final_result = result
                 chunk = result.get("text", "")
                 if return_top_tokens > 0:
                     self._capture_logprobs(result)
 
                 step_tokens = result.get("token_ids")
                 if step_tokens is not None:
-                    self.last_completion_token_count += len(step_tokens)
+                    emitted_tokens += step_tokens.numel()
+                    self.last_completion_token_count = emitted_tokens
 
                 if chunk:
+                    if first_output_time is None:
+                        first_output_time = time.perf_counter()
                     response_text += chunk
                     yield response_text
+                if final_result is not None:
+                    break
         finally:
             self.parallel_generator.cancel(job)
+            metrics.update(
+                job_id=getattr(job, 'serial_number', None),
+                completed=final_result is not None,
+                emitted_tokens=emitted_tokens,
+                total_seconds=time.perf_counter() - request_start,
+                time_to_first_output=first_output_time - request_start if first_output_time is not None else None,
+            )
+            if final_result is not None:
+                for key in ('time_enqueued', 'time_prefill', 'time_generate', 'cached_tokens', 'prompt_tokens',
+                            'new_tokens', 'accepted_draft_tokens', 'rejected_draft_tokens'):
+                    if key in final_result:
+                        metrics[key] = final_result[key]
+                gen_time = metrics.get('time_generate', 0)
+                metrics['decode_tokens_per_second'] = metrics.get('new_tokens', 0) / gen_time if gen_time > 0 else None
+                accepted = metrics.get('accepted_draft_tokens', 0)
+                attempted = accepted + metrics.get('rejected_draft_tokens', 0)
+                metrics['draft_acceptance'] = accepted / attempted if attempted else None
+                decode_rate = metrics['decode_tokens_per_second']
+                acceptance = metrics['draft_acceptance']
+                decode_label = f'{decode_rate:.2f}' if decode_rate is not None else 'n/a'
+                acceptance_label = f'{acceptance:.1%}' if acceptance is not None else 'n/a'
+                logger.info(
+                    f"ExLlamaV3 job {metrics['job_id']}: "
+                    f"decode {decode_label} tokens/s, "
+                    f"prefill {metrics.get('time_prefill', 0):.3f}s, "
+                    f"queue {metrics.get('time_enqueued', 0):.3f}s, "
+                    f"images {metrics['image_seconds']:.3f}s, "
+                    f"cached {metrics.get('cached_tokens', 0)}/{metrics.get('prompt_tokens', 0)} tokens, "
+                    f"draft acceptance {acceptance_label} ({accepted}/{attempted})"
+                )
+            with self.performance_lock:
+                self.performance_history.append(metrics)
+
+    def get_performance_stats(self):
+        with self.performance_lock:
+            recent = [dict(item) for item in self.performance_history]
+        return {'recent_requests': recent, 'image_cache': self.image_cache.info(),
+                'max_chunk_size': self.generator.max_chunk_size if self.generator else None}
 
     def _capture_logprobs(self, result):
         """Convert ExLlamav3 top-k token data to the shared logprobs format."""
@@ -559,6 +660,16 @@ class Exllamav3Model:
                 self.parallel_generator.stop()
             except Exception as e:
                 logger.warning(f"Error stopping parallel generator: {e}")
+
+        self.image_cache.clear()
+        with self.performance_lock:
+            self.performance_history.clear()
+
+        if self.vision_model is not None:
+            try:
+                self.vision_model.unload()
+            except Exception as e:
+                logger.warning(f"Error unloading vision model: {e}")
 
         if self.draft_model is not None:
             try:

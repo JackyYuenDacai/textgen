@@ -32,3 +32,4 @@ wandb
 /docker-compose.yml
 /Dockerfile
 .env
+/downloads

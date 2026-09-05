@@ -62,6 +62,8 @@ loaders_and_params = OrderedDict({
     ],
     'ExLlamav3': [
         'ctx_size',
+        'exl3_image_cache_mib',
+        'exl3_max_chunk_size',
         'cache_type',
         'gpu_split',
         'draft_model_header',

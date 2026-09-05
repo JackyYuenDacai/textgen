@@ -30,6 +30,7 @@ from modules.html_generator import (
 )
 from modules.image_utils import open_image_safely
 from modules.logging_colors import logger
+from modules.prompt_utils import stable_tool_definitions
 from modules.reasoning import THINKING_FORMATS, extract_reasoning
 from modules.text_generation import (
     generate_reply,
@@ -363,11 +364,12 @@ def generate_chat_prompt(user_input, state, **kwargs):
 
     instruction_template = get_compiled_template(state['instruction_template_str'])
     chat_template = get_compiled_template(chat_template_str)
+    tools = stable_tool_definitions(state.get('tools'))
 
     instruct_renderer = partial(
         instruction_template.render,
         builtin_tools=None,
-        tools=state['tools'] if 'tools' in state else None,
+        tools=tools,
         tools_in_user_message=False,
         add_generation_prompt=False,
         enable_thinking=state['enable_thinking'],
@@ -385,7 +387,7 @@ def generate_chat_prompt(user_input, state, **kwargs):
         name1=state['name1'],
         name2=state['name2'],
         user_bio=replace_character_names(state['user_bio'], state['name1'], state['name2']),
-        tools=state['tools'] if 'tools' in state else None,
+        tools=tools,
     )
 
     active_template_str = state['instruction_template_str'] if state['mode'] == 'instruct' else chat_template_str

@@ -93,6 +93,11 @@ def create_ui():
 
                         with gr.Column():
                             shared.gradio['truncation_length'] = gr.Number(precision=0, step=256, value=get_truncation_length(), label='Truncate the prompt up to this length', info='The leftmost tokens are removed if the prompt exceeds this length.')
+                            with gr.Row():
+                                shared.gradio['context_32k'] = gr.Button('32k context', size='sm')
+                                shared.gradio['context_64k'] = gr.Button('64k context', size='sm')
+                                shared.gradio['context_full'] = gr.Button('Full context', size='sm')
+                            gr.Markdown('Shorter context can speed up replies by sending less old history. Saved chats are kept; omitted details are unavailable to the model. Full context restores the loaded model\'s limit.')
                             shared.gradio['seed'] = gr.Number(value=shared.settings['seed'], label='Seed (-1 for random)')
                             shared.gradio['custom_system_message'] = gr.Textbox(value=shared.settings['custom_system_message'], lines=2, label='Custom system message', info='If not empty, will be used instead of the default one.', elem_classes=['add_scrollbar'])
                             shared.gradio['custom_stopping_strings'] = gr.Textbox(lines=2, value=shared.settings["custom_stopping_strings"] or None, label='Custom stopping strings', info='Written between "" and separated by commas.', placeholder='"\\n", "\\nYou:"')
@@ -110,6 +115,9 @@ def create_ui():
 
 
 def create_event_handlers():
+    for name, limit in [('context_32k', 32768), ('context_64k', 65536), ('context_full', None)]:
+        shared.gradio[name].click(
+            lambda limit=limit: context_limit(limit), inputs=[], outputs=gradio('truncation_length'), show_progress=False)
     shared.gradio['filter_by_loader'].change(loaders.blacklist_samplers, gradio('filter_by_loader', 'dynamic_temperature'), gradio(loaders.list_all_samplers()), show_progress=False)
     shared.gradio['preset_menu'].change(
         ui.gather_interface_values, gradio(shared.input_elements), gradio('interface_state')).then(
@@ -132,6 +140,11 @@ def get_truncation_length():
         return shared.args.ctx_size
     else:
         return shared.settings['truncation_length']
+
+
+def context_limit(requested=None):
+    loaded_limit = getattr(shared.model, 'max_tokens', None) or shared.args.ctx_size or shared.settings['truncation_length']
+    return min(requested, loaded_limit) if requested is not None else loaded_limit
 
 
 def load_grammar(name):

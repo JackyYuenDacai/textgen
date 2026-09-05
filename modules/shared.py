@@ -136,6 +136,8 @@ group.add_argument('--quant_type', type=str, default='nf4', help='quant_type for
 
 # ExLlamaV3
 group = parser.add_argument_group('ExLlamaV3')
+group.add_argument('--exl3-image-cache-mib', type=int, default=256, help='Maximum MiB of reusable ExLlamaV3 image embeddings. 0 disables reuse.')
+group.add_argument('--exl3-max-chunk-size', type=int, default=2048, help='ExLlamaV3 prompt processing chunk size, in multiples of 256. Larger values need more temporary VRAM.')
 group.add_argument('--gpu-split', type=str, help='Comma-separated list of VRAM (in GB) to use per GPU device for model layers. Example: 20,7,7.')
 group.add_argument('--enable-tp', '--enable_tp', action='store_true', help='Enable Tensor Parallelism (TP) to split the model across GPUs.')
 group.add_argument('--tp-backend', type=str, default='native', help='The backend for tensor parallelism. Valid options: native, nccl. Default: native.')

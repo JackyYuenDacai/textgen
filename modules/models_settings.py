@@ -115,6 +115,12 @@ def get_model_metadata(model):
             if 'torch_dtype' in metadata and metadata['torch_dtype'] == 'bfloat16':
                 model_settings['bf16'] = True
 
+            # EXL3 builds can ship a native MTP head in the same checkpoint; flag it so the
+            # EXL3 loader can use it as the speculative draft model (no external draft needed)
+            _text_cfg = metadata.get('text_config', {}) or {}
+            if metadata.get('mtp_num_hidden_layers') or _text_cfg.get('mtp_num_hidden_layers'):
+                model_settings['spec_type'] = 'draft-mtp'
+
     # Try to find the Jinja instruct template
     path = model_path / 'tokenizer_config.json'
     template = None

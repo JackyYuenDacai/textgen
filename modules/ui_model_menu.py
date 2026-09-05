@@ -75,6 +75,8 @@ def create_ui():
                             shared.gradio['cache_type'] = gr.Dropdown(label="cache-type", choices=['fp16', 'q8_0', 'q4_0', 'fp8', 'q8', 'q7', 'q6', 'q5', 'q4', 'q3', 'q2'], value=shared.args.cache_type, allow_custom_value=True, info='Valid options: llama.cpp - fp16, q8_0, q4_0; ExLlamaV3 - fp16, q2 to q8. For ExLlamaV3, you can type custom combinations for separate k/v bits (e.g. q4_q8).')
                             shared.gradio['split_mode'] = gr.Dropdown(label='split-mode', choices=['layer', 'row', 'tensor', 'none'], value=shared.args.split_mode, info='How to split the model across multiple GPUs. "tensor" can make multi-GPU significantly faster.')
                             shared.gradio['tp_backend'] = gr.Dropdown(label="tp-backend", choices=['native', 'nccl'], value=shared.args.tp_backend, info='The backend for tensor parallelism.')
+                            shared.gradio['exl3_image_cache_mib'] = gr.Number(label='Image embedding cache (MiB)', value=shared.args.exl3_image_cache_mib, minimum=0, precision=0, info='Reuse unchanged images across requests. Bounded memory; 0 disables. Takes effect on model reload.')
+                            shared.gradio['exl3_max_chunk_size'] = gr.Number(label='Prompt processing chunk size', value=shared.args.exl3_max_chunk_size, minimum=256, step=256, precision=0, info='ExLlamaV3: 2048 is the default. Larger chunks may improve long-prompt processing but need more temporary VRAM. Takes effect on model reload.')
 
                         with gr.Column():
                             shared.gradio['vram_info'] = gr.HTML(value=get_initial_vram_info())
