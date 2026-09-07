@@ -69,11 +69,43 @@ class ConcurrentGenerator:
     def __init__(self, generator):
         self.generator = generator
         self.lock = threading.Lock()
+        # ``generator.iterate()`` must not run concurrently with the native
+        # generator's mutating methods, so the worker owns the generator lock.
+        # Cancellation can arrive while iterate() is in a long prefill, though;
+        # waiting for ``lock`` in cancel() would then deadlock the worker when
+        # the request consumer has already stopped reading its result queue.
+        # Keep cancellation requests in a separate, short-lived mailbox and
+        # apply them from the worker between inference rounds.
+        self.cancel_requests = set()
+        self.cancel_requests_lock = threading.Lock()
         self.job_queues = {}
         self.active = True
         self.has_jobs = threading.Event()
         self.thread = threading.Thread(target=self._iterate_loop, daemon=True)
         self.thread.start()
+
+    def _take_cancel_requests(self):
+        with self.cancel_requests_lock:
+            requests = tuple(self.cancel_requests)
+            self.cancel_requests.clear()
+        return requests
+
+    def _cancel_jobs(self, jobs):
+        """Cancel requested jobs while the generator lock is held."""
+        for job in jobs:
+            if job not in self.job_queues:
+                continue
+
+            try:
+                self.generator.cancel(job)
+            except Exception:
+                # Always remove the routing entry even if native cleanup fails;
+                # otherwise the worker can continue iterating a dead request.
+                logger.exception("Exception cancelling ExLlamaV3 job")
+
+            q = self.job_queues.pop(job, None)
+            if q is not None:
+                q.put(None)
 
     def _iterate_loop(self):
         while self.active:
@@ -82,6 +114,14 @@ class ConcurrentGenerator:
                 if not self.job_queues:
                     self.has_jobs.clear()
                     continue
+
+                # Handle cancellation that arrived while the worker was idle
+                # before starting another native inference round.
+                self._cancel_jobs(self._take_cancel_requests())
+                if not self.job_queues:
+                    self.has_jobs.clear()
+                    continue
+
                 try:
                     results = self.generator.iterate()
                 except Exception:
@@ -92,6 +132,11 @@ class ConcurrentGenerator:
                     self.generator.clear_queue()
                     self.has_jobs.clear()
                     continue
+
+                # A cancellation may have arrived during iterate(). Apply it
+                # before routing results, so no post-cancel output is exposed
+                # and the native job cannot be iterated again.
+                self._cancel_jobs(self._take_cancel_requests())
                 for result in results:
                     job = result["job"]
                     q = self.job_queues.get(job)
@@ -111,11 +156,12 @@ class ConcurrentGenerator:
         return q
 
     def cancel(self, job):
-        with self.lock:
-            if job in self.job_queues:
-                self.generator.cancel(job)
-                self.job_queues[job].put(None)
-                del self.job_queues[job]
+        # Do not wait for the worker's inference lock.  A long prompt prefill
+        # can keep it held for minutes; enqueueing the request lets the worker
+        # perform native cancellation as soon as that round returns.
+        with self.cancel_requests_lock:
+            self.cancel_requests.add(job)
+        self.has_jobs.set()
 
     def stop(self):
         self.active = False
@@ -336,15 +382,12 @@ class Exllamav3Model:
                 # Do not reset the cache/allocator index; it causes token ID conflicts during generation.
                 pp = getattr(self.vision_model.config, 'vision_pp', None)
                 processing_key = (id(self.vision_model), json.dumps(vars(pp) if pp else {}, sort_keys=True, default=str))
-                image_embeddings = []
-                hits = 0
-                for img in pil_images:
-                    embedding, hit = self.image_cache.get_or_create(
-                        img, processing_key,
-                        lambda: self.vision_model.get_image_embeddings(tokenizer=self.tokenizer, image=img),
-                    )
-                    image_embeddings.append(embedding)
-                    hits += hit
+                resolved = self.image_cache.get_or_create_many(
+                    pil_images, processing_key,
+                    lambda img: self.vision_model.get_image_embeddings(tokenizer=self.tokenizer, image=img),
+                )
+                image_embeddings = [embedding for embedding, _ in resolved]
+                hits = sum(hit for _, hit in resolved)
                 logger.info(f"ExLlamaV3 images: {hits} reused, {len(pil_images) - hits} encoded")
                 if metrics is not None:
                     metrics.update(image_cache_hits=hits, image_cache_misses=len(pil_images) - hits)

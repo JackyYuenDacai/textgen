@@ -1,7 +1,16 @@
-"""Bounded reuse of complete multimodal embeddings, including their token IDs."""
+"""Bounded embedding tensors with model-lifetime image token identities."""
 import hashlib
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ImageTokenIdentity:
+    first_index: int
+    last_index: int
+    text_alias: str
+    layout: bytes
 
 
 class ImageEmbeddingCache:
@@ -9,6 +18,9 @@ class ImageEmbeddingCache:
         self.max_bytes = max(0, int(max_bytes))
         self.max_entries = max_entries
         self.entries = OrderedDict()
+        # Keep only small scalar/hash records after tensor eviction. Never recycle IDs:
+        # old prompt KV pages or in-flight jobs may still refer to them until unload.
+        self.identities = {}
         self.bytes = 0
         self.lock = threading.RLock()
 
@@ -34,31 +46,80 @@ class ImageEmbeddingCache:
         return sum(storages.values())
 
     def get_or_create(self, image, processing_key, create):
-        if not self.max_bytes or not self.max_entries:
-            return create(), False
+        return self.get_or_create_many([image], processing_key, lambda _: create())[0]
 
-        key = self.image_key(image, processing_key)
-        # Serialize misses too: simultaneous requests for the same image must reuse IDs.
+    def _restore_identity(self, key, embedding):
+        first, last = embedding.first_index, embedding.last_index
+        # Normalize only the synthetic IDs, preserving delimiters, ordering and MRoPE
+        # geometry. A different encoder layout must not reuse incompatible KV pages.
+        tokens = embedding.token_string[0].tolist()
+        normalized = tuple(-(token - first + 1) if first <= token < last else token for token in tokens)
+        layout = hashlib.sha256(repr((embedding.mm_length, embedding.full_length,
+                                     embedding.grid_thw, embedding.mrope_merge_size, normalized)).encode()).digest()
+        identity = self.identities.get(key)
+        if identity is not None and identity.layout == layout:
+            # Only touch the newly encoded object's token tensor. An evicted object
+            # can still be in use by generation, including its deepstack tensors.
+            token_string = embedding.token_string.clone()
+            mask = (token_string >= first) & (token_string < last)
+            token_string[mask] += identity.first_index - first
+            embedding.token_string = token_string
+            embedding.token_list = token_string[0].tolist()
+            embedding.first_index = identity.first_index
+            embedding.last_index = identity.last_index
+            embedding.text_alias = identity.text_alias
+        else:
+            self.identities[key] = ImageTokenIdentity(first, last, embedding.text_alias, layout)
+
+    def get_or_create_many(self, images, processing_key, create):
+        """Resolve a whole request without evicting any of its resident images.
+
+        The returned objects belong to the request even when its working set exceeds
+        the retained-cache budget. Duplicate images encode once per request. A hit
+        means tensor reuse, not merely restoration of synthetic token IDs.
+        """
+        images = list(images)
+        keys = [self.image_key(image, processing_key) for image in images]
+        protected = set(keys)
+        # Serialize misses too: simultaneous requests for the same image reuse IDs.
         with self.lock:
-            if key in self.entries:
-                self.entries.move_to_end(key)
-                return self.entries[key][0], True
+            resolved = {}
+            results = []
+            for image, key in zip(images, keys):
+                if key in resolved:
+                    results.append((resolved[key], True))
+                    continue
+                if key in self.entries:
+                    self.entries.move_to_end(key)
+                    embedding = self.entries[key][0]
+                    resolved[key] = embedding
+                    results.append((embedding, True))
+                    continue
 
-            embedding = create()
-            size = self.embedding_bytes(embedding)
-            if size <= self.max_bytes:
-                while self.entries and (self.bytes + size > self.max_bytes or len(self.entries) >= self.max_entries):
-                    _, (_, evicted_size) = self.entries.popitem(last=False)
-                    self.bytes -= evicted_size
-                self.entries[key] = (embedding, size)
-                self.bytes += size
-            return embedding, False
+                embedding = create(image)
+                self._restore_identity(key, embedding)
+                resolved[key] = embedding
+                results.append((embedding, False))
+                size = self.embedding_bytes(embedding)
+                if self.max_bytes and self.max_entries > 0 and size <= self.max_bytes:
+                    while self.bytes + size > self.max_bytes or len(self.entries) >= self.max_entries:
+                        victim = next((entry for entry in self.entries if entry not in protected), None)
+                        if victim is None:
+                            break  # Needed by this request: retain it, don't churn the LRU.
+                        _, evicted_size = self.entries.pop(victim)
+                        self.bytes -= evicted_size
+                    else:
+                        self.entries[key] = (embedding, size)
+                        self.bytes += size
+            return results
 
     def clear(self):
         with self.lock:
             self.entries.clear()
+            self.identities.clear()
             self.bytes = 0
 
     def info(self):
         with self.lock:
-            return {'entries': len(self.entries), 'bytes': self.bytes, 'max_bytes': self.max_bytes}
+            return {'entries': len(self.entries), 'bytes': self.bytes, 'max_bytes': self.max_bytes,
+                    'token_identities': len(self.identities)}

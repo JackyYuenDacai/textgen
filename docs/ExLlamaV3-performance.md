@@ -4,11 +4,13 @@ The native ExLlamav3 loader reuses unchanged images and reports generation timin
 
 ## Image reuse
 
-The image cache retains complete embedding objects, including their synthetic token IDs and position metadata. An unchanged image therefore keeps the same tokenized prompt prefix on the next request. Keys include decoded pixels, image dimensions/mode, the vision model instance and preprocessing settings. Changing the image or preprocessing creates a new entry. Model unload clears the cache and unloads the vision component.
+The image cache retains complete embedding objects, including their synthetic token IDs and position metadata. It separately keeps a small identity record for each image for the lifetime of the loaded model, even after that image's tensors are evicted. Re-encoding an unchanged image restores its original IDs, token list and alias, so eviction alone no longer changes the tokenized prompt prefix. Keys include decoded pixels, image dimensions/mode, the vision model instance and preprocessing settings. Changing the image or preprocessing creates a new identity; a changed token layout or position geometry also prevents reuse of incompatible IDs. Model unload clears both the tensor cache and identity records without resetting the global token allocator.
 
-The default limit is **256 MiB**, with at most 32 entries and least-recently-used eviction. Tensor backing allocations are counted, including deepstack tensors. The installed Qwen vision encoder returns these tensors in CPU memory. An embedding larger than the limit is used for its request without being retained. Eviction does not modify embeddings held by an active request.
+The default tensor limit is **256 MiB**, with at most 32 retained entries. Tensor backing allocations are counted, including deepstack tensors. The installed Qwen vision encoder returns these tensors in CPU memory. Each request identifies all its images before encoding starts: resident images needed anywhere in that request are protected, and eviction selects only other least-recently-used entries. If no unprotected entry can make room, the new embedding is used for that request without being retained. Duplicate images encode at most once per request. Eviction does not modify embeddings held by an active request.
 
-Set **Model → Image embedding cache (MiB)**, save model settings, and reload to change the limit. Set it to 0 to disable reuse. The CLI equivalent is `--exl3-image-cache-mib 256`.
+The tensor limit is a retained-cache budget, not a limit on all embeddings needed by an active request. Identity records contain only hashes, integers and aliases (no images or tensors); their count grows with distinct images until model unload. Retaining these small records is what preserves token IDs across eviction. An over-budget history may still need some image re-encoding, but should retain its existing image hits and stable prompt IDs instead of repeatedly evicting the entire image history.
+
+Set **Model → Image embedding cache (MiB)**, save model settings, and reload to change the limit. Set it to 0 to disable tensor retention across requests; token identities still remain stable. The CLI equivalent is `--exl3-image-cache-mib 256`. After updating the Python implementation, restart TextGen to load the code; changing the cache size alone does not reload Python modules. A restart initially starts with cold caches.
 
 ## Stable prompts and context controls
 
@@ -23,7 +25,7 @@ The console now labels its original overall speed as `tokens/s end-to-end`. A se
 `GET /v1/internal/model/info` additionally returns `performance`:
 
 - `recent_requests`: up to 32 request records, each with a job ID and completion status. Completed requests include backend timing, generated/emitted token counts, cache hits and draft acceptance.
-- `image_cache`: retained entry count, tensor bytes and byte limit.
+- `image_cache`: retained entry count, tensor bytes, byte limit and `token_identities` count. Request-level `image_cache_hits` counts embedding reuse, not re-encodings that only recover the same token IDs.
 - `max_chunk_size`: the active prompt processing chunk size.
 
 Request metrics contain no prompt, image or generated text. Cancelled/interrupted requests do not inherit a previous request's completion timing. Backend generated counts may include a stop token; API usage also retokenizes visible text and can differ. The wrapper now consumes text, token IDs and logprobs in the final event before ending the stream, and counts tensor elements rather than the tensor's batch dimension.
