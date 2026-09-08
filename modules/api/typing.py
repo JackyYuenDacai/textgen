@@ -8,6 +8,7 @@ from modules import shared
 
 
 class GenerationOptions(BaseModel):
+    cache_friendly_current_time: bool = Field(default=True, description="For instruct chat requests, move exact <current_time>...</current_time> blocks from leading system context near the end of the prompt to preserve prefix cache reuse. Set false for templates requiring system text only at the beginning.")
     preset: str | None = Field(default=None, description="The name of a file under textgen/user_data/presets (without the .yaml extension). The sampling parameters that get overwritten by this option are the keys in the default_preset() function in modules/presets.py.")
     dynatemp_low: float = shared.args.dynatemp_low
     dynatemp_high: float = shared.args.dynatemp_high

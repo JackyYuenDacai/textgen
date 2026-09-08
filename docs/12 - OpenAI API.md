@@ -17,6 +17,25 @@ Add `--api` to your command-line flags.
 * To use SSL, add `--ssl-keyfile key.pem --ssl-certfile cert.pem`. ⚠️ **Note**: this doesn't work with `--public-api` since Cloudflare already uses HTTPS by default.
 * To use an API key for authentication, add `--api-key yourkey`.
 
+### WorkBuddy current-time context and prompt caching
+
+For API chat requests in `instruct` mode (including Anthropic Messages), TextGen
+moves exact `<current_time>...</current_time>` blocks from leading system/developer
+context to a system message after the conversation, before any trailing assistant
+prefill. The current time is preserved. Its changing value therefore no longer
+invalidates the stable instructions and earlier history. This applies to plain-text
+tag contents, including multiline timestamps; user messages, tool results, and
+other tags such as `<time>` are unchanged. If WorkBuddy puts the block in a user
+message, this workaround does not relocate it.
+
+This behavior defaults to enabled. Send `"cache_friendly_current_time": false` to
+disable it, particularly for chat templates that only support a leading system
+message. It does not affect web chat or raw text completions. Restart TextGen after
+updating the code; the first request warms the new prompt layout. Reuse still
+depends on the backend retaining the matching prefix and on other prompt content
+remaining unchanged. Moving the time each turn can still require reprocessing the
+previous turn's tail; it does not guarantee a full-history cache hit.
+
 ### Examples
 
 For the documentation with all the endpoints, parameters and their types, consult `http://127.0.0.1:5000/docs` or the [typing.py](https://github.com/oobabooga/textgen/blob/main/modules/api/typing.py) file.

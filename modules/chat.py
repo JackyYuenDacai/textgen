@@ -30,7 +30,7 @@ from modules.html_generator import (
 )
 from modules.image_utils import open_image_safely
 from modules.logging_colors import logger
-from modules.prompt_utils import stable_tool_definitions
+from modules.prompt_utils import relocate_current_time, stable_tool_definitions
 from modules.reasoning import THINKING_FORMATS, extract_reasoning
 from modules.text_generation import (
     generate_reply,
@@ -574,6 +574,8 @@ def generate_chat_prompt(user_input, state, **kwargs):
         messages.append({"role": "user", "content": "fake user message replace me"})
 
     def make_prompt(messages):
+        if state['mode'] == 'instruct' and state.get('cache_friendly_current_time', False):
+            messages = relocate_current_time(messages)
         if _continue:
             messages = copy.deepcopy(messages)
         last_message = messages[-1].copy()

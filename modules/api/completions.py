@@ -569,6 +569,7 @@ def chat_completions_common(body: dict, is_legacy: bool = False, stream=False, p
         'user_bio': user_bio,
         'instruction_template_str': instruction_template_str,
         'custom_system_message': custom_system_message,
+        'cache_friendly_current_time': body.get('cache_friendly_current_time', True),
         'chat_template_str': chat_template_str,
         'chat-instruct_command': chat_instruct_command,
         'tools': tools,
