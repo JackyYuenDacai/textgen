@@ -1,0 +1,6 @@
+{
+  "openai_options": {
+    "service_tier": "fast",
+    "fast_mode": true
+  }
+}

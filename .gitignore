@@ -33,3 +33,4 @@ wandb
 /Dockerfile
 .env
 /downloads
+/backups

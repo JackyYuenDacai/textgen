@@ -184,7 +184,7 @@ class GenerationTests(unittest.TestCase):
         self.model = Exllamav3Model()
         self.model.tokenizer = SimpleNamespace(encode=lambda *a, **k: torch.tensor([[1, 2, 3]]))
         self.model.config = SimpleNamespace(eos_token_id_list=[9])
-        self.model.generator = SimpleNamespace(max_chunk_size=2048)
+        self.model.generator = SimpleNamespace(max_chunk_size=2048, max_total_tokens=256000, num_draft_tokens=0)
         self.model.parallel_generator = Mock()
         self.model._capture_logprobs = Mock()
         self.state = dict(shared.settings, temperature=0, max_new_tokens=4, truncation_length=1024,
@@ -226,6 +226,44 @@ class GenerationTests(unittest.TestCase):
         stats = self.model.get_performance_stats()['recent_requests'][-1]
         self.assertIsNone(stats['decode_tokens_per_second'])
         self.assertIsNone(stats['draft_acceptance'])
+
+    def test_full_cache_output_reserves_generation_headroom(self):
+        for auto_max in (False, True):
+            for draft_tokens in (0, 4):
+                with self.subTest(auto_max=auto_max, draft_tokens=draft_tokens):
+                    self.model.generator.num_draft_tokens = draft_tokens
+                    self.model.tokenizer.encode = Mock(return_value=torch.ones((1, 526), dtype=torch.long))
+                    self.state.update(truncation_length=256000, max_new_tokens=255474,
+                                      auto_max_new_tokens=auto_max)
+                    self.events({'eos': True, 'text': '', 'new_tokens': 0})
+                    with patch('modules.exllamav3.Job') as job:
+                        self.model.generate('prompt', self.state)
+                    self.assertEqual(job.call_args.kwargs['input_ids'].shape[-1], 526)
+                    self.assertEqual(job.call_args.kwargs['max_new_tokens'], 255473 - draft_tokens)
+
+    def test_request_context_larger_than_cache_is_clamped(self):
+        self.model.generator.max_total_tokens = 1024
+        self.model.generator.num_draft_tokens = 4
+        self.model.tokenizer.encode = Mock(return_value=torch.ones((1, 1500), dtype=torch.long))
+        self.state.update(truncation_length=4096, auto_max_new_tokens=True)
+        self.events({'eos': True, 'text': '', 'new_tokens': 0})
+        with patch('modules.exllamav3.Job') as job:
+            self.model.generate('prompt', self.state)
+        self.assertEqual(job.call_args.kwargs['input_ids'].shape[-1], 1018)
+        self.assertEqual(job.call_args.kwargs['max_new_tokens'], 1)
+
+    def test_small_output_limit_is_preserved(self):
+        self.events({'eos': True, 'text': '', 'new_tokens': 0})
+        with patch('modules.exllamav3.Job') as job:
+            self.model.generate('prompt', self.state)
+        self.assertEqual(job.call_args.kwargs['max_new_tokens'], 4)
+
+    def test_cache_without_room_for_generation_fails_before_submit(self):
+        self.model.generator.max_total_tokens = 6
+        self.model.generator.num_draft_tokens = 4
+        with self.assertRaisesRegex(ValueError, 'generation headroom'):
+            self.model.generate('prompt', self.state)
+        self.model.parallel_generator.submit.assert_not_called()
 
     def test_cancelled_request_does_not_inherit_completed_metrics(self):
         self.events({'eos': True, 'text': 'done', 'new_tokens': 4, 'time_generate': 1})

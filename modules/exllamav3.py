@@ -496,7 +496,13 @@ class Exllamav3Model:
             embeddings=image_embeddings,
         )
 
-        input_ids = input_ids[:, -get_max_prompt_length(state):]
+        cache_headroom = 1 + self.generator.num_draft_tokens
+        usable_context = min(state['truncation_length'], self.generator.max_total_tokens - cache_headroom)
+        if usable_context < 2:
+            raise ValueError('ExLlamaV3 cache cannot fit a prompt and response with generation headroom.')
+
+        max_prompt_length = min(max(1, get_max_prompt_length(state)), usable_context - 1)
+        input_ids = input_ids[:, -max_prompt_length:]
 
         self._last_prompt_token_count = input_ids.shape[-1]
 
@@ -504,6 +510,8 @@ class Exllamav3Model:
             max_new_tokens = state['truncation_length'] - self._last_prompt_token_count
         else:
             max_new_tokens = state['max_new_tokens']
+
+        max_new_tokens = min(max_new_tokens, usable_context - self._last_prompt_token_count)
 
         eos_ids = [eid for eid in self.config.eos_token_id_list if eid is not None]
 
