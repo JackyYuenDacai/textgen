@@ -40,7 +40,6 @@ from modules.image_utils import (
     convert_openai_messages_to_images
 )
 from modules.logging_colors import logger
-from modules.text_generation import get_max_prompt_length
 
 try:
     import flash_attn
@@ -218,6 +217,13 @@ class Exllamav3Model:
 
     @classmethod
     def from_pretrained(cls, path_to_model):
+        if torch.cuda.device_count() == 0:
+            raise RuntimeError(
+                'ExLlamaV3 cannot load because PyTorch detects no CUDA GPUs. '
+                'Check NVIDIA Control Panel CUDA - GPUs, CUDA_VISIBLE_DEVICES, and the NVIDIA driver. '
+                'CUDA device numbers differ from Windows Task Manager GPU numbers. '
+                'After restoring CUDA access, restart TextGen before loading the model.'
+            )
         path_to_model = Path(f'{shared.args.model_dir}') / Path(path_to_model)
         layer_type, cache_kwargs = cls._cache_settings(shared.args.cache_type)
         adaptive_options = drafting_options(shared.args, Generator)
@@ -550,7 +556,25 @@ class Exllamav3Model:
         if usable_context < 2:
             raise ValueError('ExLlamaV3 cache cannot fit a prompt and response with generation headroom.')
 
-        max_prompt_length = min(max(1, get_max_prompt_length(state)), usable_context - 1)
+        # Preserve the full prompt while it fits. Requested output is a ceiling;
+        # below, clamp it to the remaining space instead of reserving it upfront.
+        max_prompt_length = usable_context - 1
+        original_prompt_tokens = input_ids.shape[-1]
+        metrics['prompt_budget'] = {
+            'encoded_tokens_before_loader_truncation': original_prompt_tokens,
+            'max_prompt_tokens': max_prompt_length,
+            'requested_max_new_tokens': state['max_new_tokens'],
+            'request_truncation_length': state['truncation_length'],
+            'loader_dropped_tokens': max(0, original_prompt_tokens - max_prompt_length),
+        }
+        if original_prompt_tokens > max_prompt_length:
+            logger.warning(
+                f'ExLlamaV3 prompt truncated from {original_prompt_tokens} to {max_prompt_length} tokens '
+                'because it exceeds the loaded context capacity (including generation headroom). '
+                'Dropping the prompt prefix invalidates prefix-cache reuse on subsequent turns. '
+                'Align the client input budget with the server prompt budget and compact history '
+                'before this limit. Allocator pressure relief does not clear the KV cache.'
+            )
         input_ids = input_ids[:, -max_prompt_length:]
 
         self._last_prompt_token_count = input_ids.shape[-1]
@@ -561,6 +585,7 @@ class Exllamav3Model:
             max_new_tokens = state['max_new_tokens']
 
         max_new_tokens = min(max_new_tokens, usable_context - self._last_prompt_token_count)
+        metrics['prompt_budget']['effective_max_new_tokens'] = max_new_tokens
 
         eos_ids = [eid for eid in self.config.eos_token_id_list if eid is not None]
 

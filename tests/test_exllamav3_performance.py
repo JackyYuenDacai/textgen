@@ -269,6 +269,7 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(metrics['uncached_prompt_tokens'], 256)
         self.assertEqual(metrics['prefill_tokens_per_second'], 512)
         self.assertEqual(metrics['configuration']['max_chunk_size'], 2048)
+        self.assertEqual(metrics['prompt_budget']['loader_dropped_tokens'], 0)
         self.assertIn('devices', metrics['memory_after'])
         self.assertTrue(metrics['completed'])
         self.model.parallel_generator.cancel.assert_called_once()
@@ -311,6 +312,33 @@ class GenerationTests(unittest.TestCase):
         with patch('modules.exllamav3.Job') as job:
             self.model.generate('prompt', self.state)
         self.assertEqual(job.call_args.kwargs['max_new_tokens'], 4)
+
+    def test_output_ceiling_does_not_truncate_a_prompt_that_fits(self):
+        self.model.generator.max_total_tokens = 221184
+        self.model.generator.num_draft_tokens = 4
+        self.model.tokenizer.encode = Mock(return_value=torch.arange(156000).view(1, -1))
+        self.state.update(truncation_length=221184, max_new_tokens=65536)
+        self.events({'eos': True, 'text': '', 'new_tokens': 0})
+        with patch('modules.exllamav3.Job') as job, patch('modules.exllamav3.logger.warning') as warning:
+            self.model.generate('prompt', self.state)
+        ids = job.call_args.kwargs['input_ids']
+        self.assertEqual(ids.shape[-1], 156000)
+        self.assertEqual(ids[0, 0].item(), 0)
+        self.assertEqual(job.call_args.kwargs['max_new_tokens'], 221184 - 5 - 156000)
+        budget = self.model.get_performance_stats()['recent_requests'][-1]['prompt_budget']
+        self.assertEqual(budget['loader_dropped_tokens'], 0)
+        self.assertEqual(budget['requested_max_new_tokens'], 65536)
+        warning.assert_not_called()
+
+    def test_chat_budget_matches_full_loader_input_capacity(self):
+        from modules.text_generation import get_max_prompt_length
+        self.model.generator.max_total_tokens = 221184
+        self.model.generator.num_draft_tokens = 4
+        self.state.update(truncation_length=221184, max_new_tokens=65536)
+        with patch.object(shared, 'model', self.model):
+            self.assertEqual(get_max_prompt_length(self.state), 221178)
+        with patch.object(shared, 'model', None):
+            self.assertEqual(get_max_prompt_length(self.state), 155648)
 
     def test_cache_without_room_for_generation_fails_before_submit(self):
         self.model.generator.max_total_tokens = 6
@@ -407,6 +435,13 @@ class GenerationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Unsupported ExLlamaV3 cache type'):
                 self.model._cache_settings(invalid)
         self.assertEqual(self.model._cache_settings('Q4_Q8')[1], {'k_bits': 4, 'v_bits': 8})
+
+    def test_no_cuda_fails_before_loading_model_components(self):
+        with patch('modules.exllamav3.torch.cuda.device_count', return_value=0), \
+                patch('modules.exllamav3.Config.from_directory') as load_config:
+            with self.assertRaisesRegex(RuntimeError, 'PyTorch detects no CUDA GPUs'):
+                self.model.from_pretrained('unused-model')
+            load_config.assert_not_called()
 
 
 class PromptTests(unittest.TestCase):

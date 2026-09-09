@@ -209,6 +209,14 @@ def get_token_ids(prompt):
 
 
 def get_max_prompt_length(state):
+    # ExLlamaV3 clamps the output allowance to the capacity left after the
+    # actual prompt. max_new_tokens is an upper bound, not a reason to discard
+    # a growing conversation's prefix and destroy prompt-cache reuse.
+    if shared.model is not None and shared.model.__class__.__name__ == 'Exllamav3Model':
+        generator = shared.model.generator
+        if generator is not None:
+            headroom = 1 + generator.num_draft_tokens
+            return max(1, min(state['truncation_length'], generator.max_total_tokens - headroom) - 1)
     return state['truncation_length'] - state['max_new_tokens']
 
 

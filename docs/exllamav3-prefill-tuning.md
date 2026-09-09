@@ -2,6 +2,14 @@
 
 These changes take effect on the next server restart. No restart, model reload, synthetic inference, or cache flush is performed by the tuning tools. Keep the user's selected context capacity fixed throughout comparisons.
 
+## Full prompt capacity and output allowance
+
+ExLlamaV3 now treats `max_new_tokens` as an upper bound rather than reserving it before accepting the input. Chat construction and the loader use the loaded context less speculative-generation headroom and at least one output token as the prompt limit. The effective output allowance is the lesser of the requested maximum and the space remaining after the actual prompt. For a 221184-token cache with four draft tokens, the prompt can reach 221178 tokens; a 156000-token prompt has up to 65179 output tokens available. Other loaders retain their existing budgeting behavior.
+
+This prevents the recurring 155648-token prefix truncation caused by reserving a 65536-token output allowance upfront. A prompt that exceeds the actual loaded context still requires compaction and can lose prefix reuse when truncated. The loader records the before-truncation token count, dropped tokens, prompt limit, requested output and effective output allowance in `prompt_budget`.
+
+The earlier WorkBuddy input-budget reduction was withdrawn at the user's request; its original advertised 262144 setting is restored. That advertisement does not increase the server's loaded capacity. These server code changes need a restart; no restart was performed during implementation.
+
 ## Changes
 
 - Quantized prefill staging uses 64-page / 16384-token allocation increments above small prompt sizes. At 131433 tokens, a single sequence with four KV heads of dimension 256 needs 576 MiB of combined FP16 K/V staging instead of 1024 MiB. This only changes unused allocation padding; it does not trim context or change attention inputs. The allocation is transient, but PyTorch may retain its memory. More size classes may increase fragmentation; this tradeoff must be measured.

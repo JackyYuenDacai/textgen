@@ -3,9 +3,16 @@ import signal
 import sys
 import time
 import warnings
+import faulthandler
 from functools import partial
 from pathlib import Path
 from threading import Lock, Thread
+
+# Record Python thread stacks on native faults (including Windows access
+# violations). Enable before importing native ML dependencies. No prompt or
+# local-variable contents are dumped; output follows the server's stderr log.
+if not faulthandler.is_enabled() and sys.stderr is not None:
+    faulthandler.enable(all_threads=True)
 
 import yaml
 
