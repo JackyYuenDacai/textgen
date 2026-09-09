@@ -33,6 +33,7 @@ from modules import shared
 from modules.exllamav3_cache import ImageEmbeddingCache
 from modules.exllamav3_drafting import drafting_options
 from modules.exllamav3_diagnostics import memory_snapshot, recurrent_options, recurrent_snapshot
+from modules.exllamav3_memory import MemoryPressureGuard
 from modules.exllamav3_prefill import PrefillJobMixin
 from modules.image_utils import (
     convert_image_attachments_to_pil,
@@ -77,6 +78,7 @@ class LogitBiasFilter(Filter):
 class ConcurrentGenerator:
     def __init__(self, generator):
         self.generator = generator
+        self.memory_guard = MemoryPressureGuard(torch.cuda)
         self.lock = threading.Lock()
         # ``generator.iterate()`` must not run concurrently with the native
         # generator's mutating methods, so the worker owns the generator lock.
@@ -132,6 +134,9 @@ class ConcurrentGenerator:
                     continue
 
                 try:
+                    event = self.memory_guard.check()
+                    if event is not None:
+                        logger.info(f'ExLlamaV3 allocator pressure relief: {event}')
                     results = self.generator.iterate()
                 except Exception:
                     logger.exception("Exception in ConcurrentGenerator iterate loop")
@@ -153,6 +158,7 @@ class ConcurrentGenerator:
                         if result.get('eos'):
                             # Sample mutable checkpoint state under the generator lock.
                             result['recurrent_cache'] = recurrent_snapshot(self.generator)
+                            result['memory_pressure'] = self.memory_guard.info()
                         q.put(result)
                         if result.get("eos"):
                             self.job_queues.pop(job, None)
@@ -643,6 +649,7 @@ class Exllamav3Model:
                         metrics[key] = final_result[key]
                 gen_time = metrics.get('time_generate', 0)
                 metrics['recurrent_cache'] = final_result.get('recurrent_cache')
+                metrics['memory_pressure'] = final_result.get('memory_pressure')
                 prompt_tokens = metrics.get('prompt_tokens')
                 cached_tokens = metrics.get('cached_tokens')
                 if prompt_tokens is not None and cached_tokens is not None:

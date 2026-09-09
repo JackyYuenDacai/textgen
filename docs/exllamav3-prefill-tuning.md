@@ -11,6 +11,16 @@ These changes take effect on the next server restart. No restart, model reload, 
 
 ## Interpreting memory
 
+### Pressure relief added after the 155-request run
+
+The longer session showed reserved memory growing from 20036 MiB to 21848 MiB while live allocations grew only from 17197 MiB to 17274 MiB. At job 147, free device memory became zero. Jobs 147–154 decoded at 7.9–21.9 tokens/s; some few-hundred-token prefills took tens of seconds. No allocator OOM retries were recorded, which does not rule out WDDM paging. The earlier short-session stabilization was not sufficient evidence of sustained behavior.
+
+The textgen generator worker now checks device pressure at most once per second between native inference rounds. When free device memory is below 1024 MiB and reserved minus allocated minus inactive-split memory is at least 256 MiB, it calls `torch.cuda.empty_cache()` to return unused whole allocator blocks. Reclamation attempts have a five-second cooldown, including failures. It does not clear KV, image embeddings, model weights, live graph buffers, or recurrent checkpoints, and does not reset peak counters. The same allocator may be used concurrently by image encoding; PyTorch retains live allocations regardless.
+
+Logs and completed-request `memory_pressure` records include the reclamation count, reserved bytes before/after and free device memory before/after. CUDA memory freed is measured rather than assumed. The mechanism is pressure-triggered, not a per-token cache flush. It cannot release live tensors, generally cannot release split fragments, and cannot enforce a physical-memory budget on other applications. If there is insufficient releasable memory, it leaves the allocator alone. It does not guarantee a hard VRAM cap.
+
+This change requires a server restart to load the new worker. No restart or live allocator mutation was performed during implementation. CPU-side regression tests validate the policy and generation behavior; GPU speed recovery must be checked on ordinary requests after restart.
+
 All byte fields are literal bytes. CUDA counters are process-wide, and device free memory includes other applications. Peaks explicitly named `process_peak_*` are cumulative process peaks, not request peaks. Samples do not synchronize CUDA or reset counters. A cancelled request's exit sample can precede native cleanup. Concurrent requests can overlap any sample, so do not infer per-job allocation ownership from these measurements. A missing or failed measurement is not zero usage.
 
 Recurrent-cache eviction counters are cumulative within the generator. Compare their deltas between completed requests. Checkpoints are in system RAM. Memory reserved minus allocated includes reusable/fragmented allocator memory; it is not proof of a leak. Increasing live allocations under comparable repeated workloads is a reason to investigate further.
