@@ -14,7 +14,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
-from sse_starlette import EventSourceResponse
 from starlette.concurrency import iterate_in_threadpool
 
 import modules.api.completions as OAIcompletions
@@ -24,6 +23,7 @@ import modules.api.anthropic as Anthropic
 from .tokens import token_count, token_decode, token_encode
 from .errors import OpenAIError
 from .utils import _start_cloudflared
+from .streaming_response import GenerationEventSourceResponse
 from modules import shared
 from modules.logging_colors import logger
 from modules.models import unload_model
@@ -183,8 +183,7 @@ async def openai_completions(request: Request, request_data: CompletionRequest):
             response = OAIcompletions.stream_completions(to_dict(request_data), is_legacy=is_legacy, stop_event=stop_event)
             try:
                 async for resp in iterate_in_threadpool(response):
-                    disconnected = await request.is_disconnected()
-                    if disconnected:
+                    if stop_event.is_set():
                         break
 
                     yield {"data": json.dumps(resp)}
@@ -194,7 +193,7 @@ async def openai_completions(request: Request, request_data: CompletionRequest):
                 stop_event.set()
                 response.close()
 
-        return EventSourceResponse(generator(), sep="\n")  # SSE streaming
+        return GenerationEventSourceResponse(generator(), stop_event, sep="\n")  # SSE streaming
 
     else:
         stop_event = threading.Event()
@@ -225,8 +224,7 @@ async def openai_chat_completions(request: Request, request_data: ChatCompletion
             response = OAIcompletions.stream_chat_completions(to_dict(request_data), is_legacy=is_legacy, stop_event=stop_event)
             try:
                 async for resp in iterate_in_threadpool(response):
-                    disconnected = await request.is_disconnected()
-                    if disconnected:
+                    if stop_event.is_set():
                         break
 
                     yield {"data": json.dumps(resp)}
@@ -236,7 +234,7 @@ async def openai_chat_completions(request: Request, request_data: ChatCompletion
                 stop_event.set()
                 response.close()
 
-        return EventSourceResponse(generator(), sep="\n")  # SSE streaming
+        return GenerationEventSourceResponse(generator(), stop_event, sep="\n")  # SSE streaming
 
     else:
         stop_event = threading.Event()
@@ -285,8 +283,7 @@ async def _anthropic_generate(request, request_data, converted, model):
             response = OAIcompletions.stream_chat_completions(converted, is_legacy=False, stop_event=stop_event)
             try:
                 async for resp in iterate_in_threadpool(response):
-                    disconnected = await request.is_disconnected()
-                    if disconnected:
+                    if stop_event.is_set():
                         break
 
                     for event in converter.process_chunk(resp):
@@ -306,7 +303,7 @@ async def _anthropic_generate(request, request_data, converted, model):
                 stop_event.set()
                 response.close()
 
-        return EventSourceResponse(generator(), sep="\n")
+        return GenerationEventSourceResponse(generator(), stop_event, sep="\n")
 
     else:
         stop_event = threading.Event()

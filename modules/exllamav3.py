@@ -12,7 +12,8 @@ import torch
 
 from exllamav3 import Cache, Config, Generator, Model, Tokenizer
 from exllamav3.cache import CacheLayer_fp16, CacheLayer_quant
-from exllamav3.generator import Job
+from exllamav3.constants import PAGE_SIZE
+from exllamav3.generator import Job as ExLlamaJob
 from exllamav3.generator.filter import Filter
 from exllamav3.generator.sampler import (
     CustomSampler,
@@ -29,6 +30,7 @@ from exllamav3.generator.sampler import (
 from modules import shared
 from modules.exllamav3_cache import ImageEmbeddingCache
 from modules.exllamav3_drafting import drafting_options
+from modules.exllamav3_prefill import PrefillJobMixin
 from modules.image_utils import (
     convert_image_attachments_to_pil,
     convert_openai_messages_to_images
@@ -40,6 +42,10 @@ try:
     import flash_attn
 except Exception:
     logger.warning('Failed to load flash-attention due to the following error:', exc_info=True)
+
+
+class Job(PrefillJobMixin, ExLlamaJob):
+    prefill_page_size = PAGE_SIZE
 
 
 class LogitBiasFilter(Filter):
