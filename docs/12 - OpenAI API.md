@@ -102,6 +102,16 @@ openai-python 3.10.0, `get_final_response()` requires `response.completed`; read
 the `response.incomplete` or `response.failed` event directly in those cases.
 Disconnecting cancels the generation and does not save a partial response.
 
+Responses generation is serialized through a process-local FIFO queue: one
+request runs at a time, including both streaming and non-streaming requests.
+Waiting requests use asynchronous tickets rather than occupying inference
+threads; a disconnected waiter is removed. Backend errors and early tool-call
+completion release the slot and close the underlying generator. This queue is
+specific to `/v1/responses`; Chat/Anthropic requests retain their own existing
+scheduling behavior. It does not alter the model's cache allocation or context
+limit. A waiting SSE connection receives keepalive comments rather than model
+output until it is admitted.
+
 Function tools use the flat Responses schema and are executed by the client:
 
 ```python
@@ -139,6 +149,11 @@ and embedded image data, not GPU KV tensors. Restarting clears stored history.
 All callers with access to this API share this storage; it is not per-user
 storage. Treat response IDs as private conversation references.
 
+Stored data is kept as immutable snapshots. Retrieving a response copies only
+the response, not its potentially large input history; continuing a conversation
+copies only the history. Large copies occur outside the storage lock, and
+request preparation/retrieval run outside the HTTP event loop.
+
 - `GET /v1/responses/{response_id}` retrieves a stored result.
 - `DELETE /v1/responses/{response_id}` deletes that stored result.
 - `store=false` supports stateless operation: replay prior input, `response.output`,
@@ -146,6 +161,14 @@ storage. Treat response IDs as private conversation references.
 
 Response storage does not purge or resize the GPU KV cache. Context capacity
 remains controlled by the loaded model and existing generation settings.
+`prompt_cache_retention="in-memory"` is accepted for local best-effort KV reuse;
+`"24h"` is rejected because this backend cannot guarantee that retention.
+Neither `prompt_cache_key` nor per-turn `client_metadata` is inserted into the
+model prompt. Cache hits depend on matching token prefixes, model state and
+available backend cache pages, not the response ID or the cache key alone.
+Keep instructions and tool definitions consistent between tool turns; tool
+definitions are normalized by the existing prompt renderer, so reordering
+equivalent tools does not change their rendered order.
 `truncation="disabled"` (default) rejects oversized input instead of silently
 discarding its prefix, including when ExLlamaV3 image embeddings exceed the
 loaded capacity. Explicit `truncation="auto"` uses the existing backend clipping
@@ -154,9 +177,30 @@ end generation earlier.
 
 This is a compatibility subset, not every OpenAI hosted feature:
 
+- Client custom tools are adapted to a JSON `input` string for the local model
+  and returned as `custom_tool_call` with the original raw text, including
+  newlines. Streaming includes `response.custom_tool_call_input.delta` and
+  `.done`; replay uses `custom_tool_call_output`. Text, regex, and Lark formats
+  are supported. Lark imports are limited to `common`; grammar definitions are
+  limited to 65,536 characters and grammar-validated input to 262,144 characters.
+  Regex matching has a 250 ms timeout. Complex Lark grammars can be expensive;
+  this is intended for trusted local client grammars such as patch syntax.
+  Dependencies are listed in `requirements/responses.txt` and included by the
+  full/portable requirement sets.
+- Function `strict=true` schemas and custom grammars are checked after generation,
+  before any executable call is delivered. This is output validation, not
+  constrained decoding: an invalid call fails the response, rather than being
+  repaired or executed. Tool schema references must be local. Undeclared tools
+  and missing/duplicate call IDs also fail before delivery.
+- `parallel_tool_calls=false` adds a one-tool instruction and validates that the
+  result contains at most one call. If the model generates multiple calls, the
+  response fails without delivering them. This option is separate from the FIFO
+  queue, which serializes generation requests regardless of tool settings.
+- Assistant input `phase` values `commentary` and `final_answer` are preserved
+  through history conversion; the local backend does not infer new phase labels.
 - Hosted tools, background jobs, Conversations, WebSockets, response compaction,
-  uploaded files, strict JSON schemas, forced tool selection, and enforcement of
-  `parallel_tool_calls=false` are not implemented. Unsupported request fields and
+  uploaded files, structured text JSON schemas, and forced tool selection
+  are not implemented. Unsupported request fields and
   unsupported tool types return errors.
 - Local reasoning is exposed as plaintext `reasoning_text`; no encrypted content
   or summaries are generated. Codex's `include=["reasoning.encrypted_content"]`
@@ -198,8 +242,8 @@ wire_api = "responses"
 This can be placed in a separate Codex profile rather than replacing your other
 provider settings. If you enable TextGen API authentication, configure the
 provider's `env_key` to reference an environment variable containing that key.
-Function-based client tools are supported; hosted web search, custom grammar
-tools, and encrypted history from a different provider are not. Start a new
+Function and custom client tools are supported; hosted web search and encrypted
+history from a different provider are not. Start a new
 conversation when switching from a hosted reasoning model to the local model.
 Validation errors identify the rejected field in both `error.message` and
 `error.param`, including when the client UI displays only the message.

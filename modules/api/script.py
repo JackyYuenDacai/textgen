@@ -267,42 +267,64 @@ async def openai_chat_completions(request: Request, request_data: ChatCompletion
 @app.post('/v1/responses', dependencies=check_key)
 async def openai_responses(request: Request, request_data: Responses.ResponsesRequest):
     # Validate and resolve history before returning HTTP 200 / starting SSE.
-    converted, history = Responses.prepare(request_data)
+    converted, history = await asyncio.to_thread(Responses.prepare, request_data)
     stop_event = threading.Event()
     if request_data.stream:
         async def generator():
             converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
-            response = OAIcompletions.stream_chat_completions(converted, stop_event=stop_event)
-            try:
-                for event in converter.start():
-                    yield event
-                async for chunk in iterate_in_threadpool(response):
-                    if stop_event.is_set():
-                        return
-                    for event in converter.process(chunk):
+            async with Responses.GENERATION_QUEUE.slot(stop_event) as admitted:
+                if not admitted:
+                    return
+                response = OAIcompletions.stream_chat_completions(converted, stop_event=stop_event)
+                try:
+                    for event in converter.start():
                         yield event
-                if not stop_event.is_set():
-                    for event in converter.finish():
-                        yield event
-            except OpenAIError as error:
-                yield converter.failed(error.message, 'invalid_prompt' if error.code < 500 else 'server_error')
-            except Exception:
-                logger.exception('Responses generation failed')
-                yield converter.failed('Local generation failed; check the server log.')
-            finally:
-                stop_event.set()
-                response.close()
+                    async for chunk in iterate_in_threadpool(response):
+                        if stop_event.is_set():
+                            return
+                        for event in converter.process(chunk):
+                            yield event
+                    if not stop_event.is_set():
+                        # Grammar/schema validation and history snapshots can
+                        # be expensive; keep queue pings and disconnects live.
+                        for event in await asyncio.to_thread(converter.finish):
+                            yield event
+                except OpenAIError as error:
+                    yield converter.failed(error.message, 'invalid_prompt' if error.code < 500 else 'server_error')
+                except Responses.ToolOutputError as error:
+                    yield converter.failed(str(error), 'model_output_invalid')
+                except Exception:
+                    logger.exception('Responses generation failed')
+                    yield converter.failed('Local generation failed; check the server log.')
+                finally:
+                    stop_event.set()
+                    response.close()
         return GenerationEventSourceResponse(generator(), stop_event, sep='\n')
 
     monitor = asyncio.create_task(_wait_for_disconnect(request, stop_event))
     try:
-        result = await asyncio.to_thread(OAIcompletions.chat_completions, converted, stop_event=stop_event)
-        if stop_event.is_set():
-            # A disconnected request must not persist a partial generation as completed.
-            return JSONResponse(status_code=499, content={'error': {'message': 'Client disconnected', 'type': 'server_error', 'param': None, 'code': None}})
-        return JSONResponse(Responses.from_chat(request_data, result, history))
+        async with Responses.GENERATION_QUEUE.slot(stop_event) as admitted:
+            if admitted:
+                worker = asyncio.create_task(asyncio.to_thread(OAIcompletions.chat_completions, converted, stop_event=stop_event))
+                try:
+                    result = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    stop_event.set()
+                    # Keep the slot until the backend has stopped; cancelling a
+                    # to_thread await does not stop its synchronous worker.
+                    try:
+                        await asyncio.shield(worker)
+                    except Exception:
+                        pass
+                    raise
+            if stop_event.is_set():
+                # A disconnected request must not persist a partial generation as completed.
+                return JSONResponse(status_code=499, content={'error': {'message': 'Client disconnected', 'type': 'server_error', 'param': None, 'code': None}})
+            return await asyncio.to_thread(lambda: JSONResponse(Responses.from_chat(request_data, result, history)))
     except OpenAIError:
         raise
+    except Responses.ToolOutputError as error:
+        raise OpenAIError(str(error)) from None
     except Exception:
         logger.exception('Responses generation failed')
         raise OpenAIError('Local generation failed; check the server log.') from None
@@ -313,7 +335,7 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
 
 @app.get('/v1/responses/{response_id}', dependencies=check_key)
 async def retrieve_response(response_id: str):
-    return JSONResponse(Responses.STORE.get(response_id)['response'])
+    return await asyncio.to_thread(lambda: JSONResponse(Responses.STORE.get(response_id, field='response')))
 
 
 @app.delete('/v1/responses/{response_id}', dependencies=check_key)

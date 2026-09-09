@@ -70,9 +70,8 @@ class ResponsesTests(unittest.TestCase):
             self.store.get(result['id'])
 
     def test_rejects_unsupported_and_invalid_inputs(self):
-        options = [dict(background=True), dict(tool_choice='required'), dict(parallel_tool_calls=False),
+        options = [dict(background=True), dict(tool_choice='required'),
                    dict(text={'format': {'type': 'json_schema'}}), dict(tools=[{'type': 'web_search'}]),
-                   dict(tools=[{'type': 'function', 'name': 'x', 'strict': True}]),
                    dict(input=[{'type': 'function_call_output', 'call_id': 'missing', 'output': 'x'}]),
                    dict(input=[{'role': 'user', 'content': [{'type': 'input_file', 'file_id': 'file_1'}]}]),
                    dict(reasoning={'summary': 'invalid'}), dict(input=[{'type': 'reasoning', 'encrypted_content': 'secret'}])]
@@ -95,6 +94,116 @@ class ResponsesTests(unittest.TestCase):
         store.put({'id': 'c'}, [])
         self.assertTrue(store.delete('c')['deleted'])
         with self.assertRaises(InvalidRequestError): store.get('c')
+
+    def test_response_lookup_does_not_copy_history_and_snapshot_is_isolated(self):
+        self.store.put({'id': 'r', 'output': []}, [{'content': 'large history'}])
+        original_copy = copy.deepcopy
+        observed = []
+        def copying(value, *args, **kwargs):
+            observed.append(value)
+            return original_copy(value, *args, **kwargs)
+        with patch.object(api.copy, 'deepcopy', side_effect=copying):
+            result = self.store.get('r', field='response')
+        self.assertEqual(observed, [{'id': 'r', 'output': []}])
+        result['output'].append('changed')
+        self.assertEqual(self.store.get('r', field='response')['output'], [])
+        self.store.put({'id': 'r', 'output': ['new']}, [])
+        size = len(json.dumps(self.store.get('r'), ensure_ascii=False, separators=(',', ':')).encode())
+        self.assertEqual(self.store.bytes, size)
+
+    def test_tool_turn_cannot_skip_unresolved_results(self):
+        with self.assertRaises(InvalidRequestError):
+            api.prepare(api.ResponsesRequest(input=[
+                {'type': 'function_call', 'call_id': 'c', 'name': 'f', 'arguments': '{}'},
+                {'role': 'user', 'content': 'New turn before result'},
+                {'type': 'function_call_output', 'call_id': 'c', 'output': 'done'}]), self.store)
+
+    def test_prompt_cache_options_do_not_change_model_input(self):
+        a, _ = api.prepare(api.ResponsesRequest(input='Stable prompt', client_metadata={'turn': 'a'},
+                           prompt_cache_key='one', prompt_cache_retention='in-memory'), self.store)
+        b, _ = api.prepare(api.ResponsesRequest(input='Stable prompt', client_metadata={'turn': 'b'},
+                           prompt_cache_key='two'), self.store)
+        a.pop('_responses_metrics'); b.pop('_responses_metrics')
+        self.assertEqual(a, b)
+        with self.assertRaises(InvalidRequestError):
+            api.prepare(api.ResponsesRequest(input='Hi', prompt_cache_retention='24h'), self.store)
+
+    def test_custom_tool_raw_input_stream_and_replay(self):
+        raw = '*** Begin Patch\n*** End Patch\n'
+        request = api.ResponsesRequest(input='Patch', tools=[{'type': 'namespace', 'name': 'editor', 'tools': [
+            {'type': 'custom', 'name': 'apply_patch', 'format': {'type': 'grammar', 'syntax': 'lark',
+             'definition': 'start: "*** Begin Patch" NEWLINE "*** End Patch" NEWLINE\n%import common.NEWLINE'}}]}])
+        body, history = api.prepare(request, self.store)
+        self.assertEqual(body['tools'][0]['function']['parameters']['required'], ['input'])
+        stream = api.StreamConverter(request, history, 'local', self.store)
+        events = stream.start() + stream.process({'choices': [{'delta': {'tool_calls': [
+            {'index': 0, 'id': 'patch1', 'function': {'name': 'editor.apply_patch', 'arguments': json.dumps({'input': raw})}}]},
+            'finish_reason': 'tool_calls'}]}) + stream.finish()
+        data = decoded(events)
+        self.assertIn('response.custom_tool_call_input.delta', [e['type'] for e in data])
+        item = data[-1]['response']['output'][0]
+        self.assertEqual(item['type'], 'custom_tool_call')
+        self.assertEqual(item['input'], raw)
+        self.assertEqual(item['namespace'], 'editor')
+        follow, _ = api.prepare(api.ResponsesRequest(previous_response_id=data[-1]['response']['id'], input=[
+            {'type': 'custom_tool_call_output', 'call_id': 'patch1', 'output': 'Success'}]), self.store)
+        call = follow['messages'][-2]['tool_calls'][0]
+        self.assertEqual(json.loads(call['function']['arguments'])['input'], raw)
+        self.assertEqual(follow['messages'][-1]['content'], 'Success')
+        with self.assertRaises(ValueError):
+            api.output_call(request, 'bad', 'editor.apply_patch', '{"input":"invalid patch"}')
+
+    def test_strict_tool_outputs_are_checked_before_exposing_calls(self):
+        request = api.ResponsesRequest(input='Read', store=False, tools=[{'type': 'function', 'name': 'read', 'strict': True,
+            'parameters': {'type': 'object', 'properties': {'id': {'type': 'integer'}}, 'required': ['id'], 'additionalProperties': False}}])
+        api.prepare(request, self.store)
+        self.assertEqual(api.output_call(request, 'ok', 'read', '{"id":1}')['arguments'], '{"id":1}')
+        with self.assertRaises(ValueError):
+            api.output_call(request, 'bad', 'read', '{"id":"text"}')
+        with self.assertRaises(InvalidRequestError):
+            api.prepare(api.ResponsesRequest(input='Read', tools=[{'type': 'function', 'name': 'read', 'strict': True,
+                'parameters': {'type': 'object', '$ref': 'https://example.com/schema'}}]), self.store)
+
+    def test_assistant_phase_survives_manual_and_stored_history(self):
+        items = [{'role': 'assistant', 'phase': 'commentary', 'content': 'Checking'},
+                 {'role': 'assistant', 'phase': 'final_answer', 'content': 'Done'}]
+        messages = api.input_messages(items)
+        self.assertEqual(len(messages), 2)
+        _, _, history = script.OAIcompletions.convert_history(messages, True)
+        self.assertEqual([entry[3]['response_assistant']['phase'] for entry in history['internal']], ['commentary', 'final_answer'])
+
+    def test_custom_regex_and_import_restrictions(self):
+        req = api.ResponsesRequest(input='Run', tools=[{'type': 'custom', 'name': 'code',
+            'format': {'type': 'grammar', 'syntax': 'regex', 'definition': '[0-9]+'}}])
+        api.prepare(req, self.store)
+        self.assertEqual(api.output_call(req, 'x', 'code', '{"input":"123"}')['input'], '123')
+        with self.assertRaises(ValueError):
+            api.output_call(req, 'x', 'code', '{"input":"abc"}')
+        with self.assertRaises(InvalidRequestError):
+            api.prepare(api.ResponsesRequest(input='Run', tools=[{'type': 'custom', 'name': 'code',
+                'format': {'type': 'grammar', 'syntax': 'lark', 'definition': '%import .private.VALUE\nstart: VALUE'}}]), self.store)
+
+    def test_tool_backend_closed_before_terminal_chunk(self):
+        body, _ = api.prepare(api.ResponsesRequest(input='Read', tools=[{'type': 'function', 'name': 'f'}], stream=True), self.store)
+        closed = threading.Event()
+        def backend(*args, **kwargs):
+            body['_responses_metrics'].update(prompt_tokens=12, completion_tokens=4)
+            try:
+                yield {'internal': [['Read', 'tool markup']]}
+                raise AssertionError('Should stop on the recognized call')
+            finally:
+                closed.set()
+        with patch.object(script.OAIcompletions, 'generate_chat_reply', side_effect=backend), \
+                patch.object(script.OAIcompletions, 'parse_tool_call', return_value=[
+                    {'type': 'function', 'function': {'name': 'f', 'arguments': {}}}]):
+            generator = script.OAIcompletions.stream_chat_completions(body)
+            try:
+                next(generator)  # Initial role chunk.
+                final = next(generator)
+                self.assertEqual(final['choices'][0]['finish_reason'], 'tool_calls')
+                self.assertTrue(closed.is_set())
+            finally:
+                generator.close()
 
     def test_codex_metadata_reasoning_hints_and_namespace_roundtrip(self):
         request = api.ResponsesRequest(input='Hi', client_metadata={'session_id': 'test'},
@@ -190,6 +299,25 @@ class ResponsesTests(unittest.TestCase):
         self.assertEqual(data[-1]['response']['output'][0]['arguments'], '{}')
         self.assertEqual(data[-1]['response']['output'][0]['call_id'], 'call_1')
 
+    def test_tool_batch_validation_never_exposes_partial_executable_output(self):
+        tool = {'type': 'function', 'name': 'f', 'strict': True,
+                'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}
+        request = api.ResponsesRequest(input='Hi', tools=[tool], store=False, parallel_tool_calls=False)
+        body, _ = api.prepare(request)
+        self.assertIn('at most one tool', body['messages'][0]['content'])
+        calls = [{'id': 'a', 'name': 'f', 'arguments': '{}'}, {'id': 'b', 'name': 'f', 'arguments': '{}'}]
+        with self.assertRaisesRegex(api.ToolOutputError, 'multiple calls'):
+            api.output_calls(request, calls)
+        request.parallel_tool_calls = True
+        for bad in ({'name': 'unknown'}, {'arguments': '{"extra":1}'}, {'id': 'a'}):
+            stream = api.StreamConverter(request, [], 'model')
+            stream.calls = {0: calls[0], 1: {**calls[1], **bad}}
+            stream.finish_reason = 'tool_calls'
+            with self.assertRaises(api.ToolOutputError):
+                stream.finish()
+            self.assertEqual(stream.response['output'], [])
+
+
     def test_reasoning_and_length_are_not_fake_completion(self):
         req = api.ResponsesRequest(input='Hi', store=False)
         stream = api.StreamConverter(req, [], 'model', self.store)
@@ -202,7 +330,78 @@ class ResponsesTests(unittest.TestCase):
         self.assertIsNone(result['response']['usage'])
 
 
+class QueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fifo_cancellation_and_exception_release_without_workers(self):
+        queue = api.GenerationQueue()
+        release = asyncio.Event()
+        order = []
+        stops = [threading.Event() for _ in range(48)]
+        async def run(index):
+            async with queue.slot(stops[index]) as admitted:
+                if not admitted: return
+                order.append(index)
+                if index == 0: await release.wait()
+                if index == 47: raise RuntimeError('expected')
+        tasks = [asyncio.create_task(run(i)) for i in range(48)]
+        try:
+            await asyncio.sleep(.02)
+            self.assertEqual(len(queue.waiters), 48)
+            self.assertEqual(order, [0])
+            stops[1].set()
+            tasks[2].cancel()
+            await asyncio.sleep(.15)
+            self.assertEqual(len(queue.waiters), 46)
+            self.assertEqual(order, [0])
+        finally:
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 3)
+        self.assertEqual(order, [0] + list(range(3,48)))
+        self.assertIsInstance(results[2], asyncio.CancelledError)
+        self.assertIsInstance(results[47], RuntimeError)
+        self.assertEqual(len(queue.waiters), 0)
+        async with queue.slot(threading.Event()) as admitted:
+            self.assertTrue(admitted)
+
+
 class RouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_nonstream_keeps_slot_until_worker_exits(self):
+        entered, stopping, release = threading.Event(), threading.Event(), threading.Event()
+        second_entered = threading.Event()
+        calls = []
+        def backend(body, *, stop_event):
+            calls.append(body['messages'][-1]['content'])
+            if len(calls) == 1:
+                entered.set()
+                if not stop_event.wait(3): raise TimeoutError('cancellation not signalled')
+                stopping.set()
+                if not release.wait(3): raise TimeoutError('cleanup not released')
+            else:
+                second_entered.set()
+            return chat_result()
+        async def receive():
+            await asyncio.Event().wait()
+        request = SimpleNamespace(receive=receive)
+        first = second = None
+        with patch.object(api, 'GENERATION_QUEUE', api.GenerationQueue()), \
+                patch.object(script.OAIcompletions, 'chat_completions', side_effect=backend):
+            try:
+                first = asyncio.create_task(script.openai_responses(request, api.ResponsesRequest(input='first', store=False)))
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                first.cancel()
+                self.assertTrue(await asyncio.to_thread(stopping.wait, 2))
+                second = asyncio.create_task(script.openai_responses(request, api.ResponsesRequest(input='second', store=False)))
+                await asyncio.sleep(.05)
+                self.assertFalse(second_entered.is_set())
+                release.set()
+                outcomes = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), 3)
+                self.assertIsInstance(outcomes[0], asyncio.CancelledError)
+                self.assertEqual(outcomes[1].status_code, 200)
+                self.assertEqual(calls, ['first', 'second'])
+            finally:
+                release.set()
+                for task in (first, second):
+                    if task and not task.done(): task.cancel()
+
     async def test_http_stream_failure_never_completed_or_stored(self):
         import httpx
         def backend(*args, **kwargs):

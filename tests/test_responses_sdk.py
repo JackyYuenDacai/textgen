@@ -64,6 +64,50 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, 'completed')
         self.assertIn('response.output_text.delta', [event.type for event in events])
 
+    async def test_sdk_custom_tool_stream_and_stateless_replay(self):
+        raw = '*** Begin Patch\n*** Add File: result.txt\n+hello\n*** End Patch'
+        tool = {'type': 'custom', 'name': 'apply_patch', 'format': {'type': 'text'}}
+        def backend(*args, **kwargs):
+            yield {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'patch_1',
+                'function': {'name': 'apply_patch', 'arguments': json.dumps({'input': raw})}}]},
+                'finish_reason': 'tool_calls'}]}
+        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
+                patch('sse_starlette.sse.AppStatus.should_exit_event', None):
+            async with self.client.responses.stream(model='local', input='Create result.txt',
+                    tools=[tool], parallel_tool_calls=False, store=False) as stream:
+                events = [event async for event in stream]
+                result = await stream.get_final_response()
+        self.assertEqual(result.output[0].type, 'custom_tool_call')
+        self.assertEqual(result.output[0].input, raw)
+        self.assertIn('response.custom_tool_call_input.done', [e.type for e in events])
+        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result('Done')) as backend:
+            follow = await self.client.responses.create(model='local', store=False, tools=[tool], input=[
+                {'role': 'user', 'content': 'Create result.txt'}, result.output[0].model_dump(exclude_none=True),
+                {'type': 'custom_tool_call_output', 'call_id': 'patch_1', 'output': 'Success'}])
+        self.assertEqual(follow.output_text, 'Done')
+        messages = backend.call_args.args[0]['messages']
+        self.assertEqual(json.loads(messages[-2]['tool_calls'][0]['function']['arguments'])['input'], raw)
+
+    async def test_invalid_generated_tool_is_a_useful_failure_not_executable(self):
+        tool = {'type': 'function', 'name': 'read', 'strict': True, 'parameters': {
+            'type': 'object', 'properties': {'id': {'type': 'integer'}}, 'required': ['id']}}
+        calls = [{'id': 'bad', 'function': {'name': 'read', 'arguments': '{"id":"wrong"}'}}]
+        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result(None, calls, 'tool_calls')):
+            # Disable SDK retries for this deterministic invalid model result.
+            with self.assertRaisesRegex(openai.InternalServerError, 'strict schema validation'):
+                await self.client.with_options(max_retries=0).responses.create(model='local', input='Read', tools=[tool])
+        def backend(*args, **kwargs):
+            yield {'choices': [{'delta': {'tool_calls': [{'index': 0, **calls[0]}]}, 'finish_reason': 'tool_calls'}]}
+        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
+                patch('sse_starlette.sse.AppStatus.should_exit_event', None):
+            stream = await self.client.responses.create(model='local', input='Read', tools=[tool], stream=True)
+            events = [event async for event in stream]
+        self.assertEqual(events[-1].type, 'response.failed')
+        self.assertEqual(events[-1].response.error.code, 'model_output_invalid')
+        self.assertEqual(events[-1].response.output, [])
+        self.assertNotIn('response.output_item.done', [event.type for event in events])
+
+
     async def test_sdk_stream_tools_and_incomplete_response(self):
         for finish_reason in ('tool_calls', 'length'):
             def backend(*args, **kwargs):

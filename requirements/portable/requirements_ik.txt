@@ -1,3 +1,4 @@
+-r ../responses.txt
 audioop-lts<1.0; python_version >= "3.13"
 ddgs==9.14.1
 fastapi==0.112.4

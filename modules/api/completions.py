@@ -440,7 +440,7 @@ def convert_history(history, preserve_response_items=False):
 
             if preserve_response_items:
                 meta['response_assistant'] = {'role': 'assistant', 'content': content}
-                for key in ('reasoning_content', 'tool_calls'):
+                for key in ('reasoning_content', 'tool_calls', 'phase'):
                     if key in entry:
                         meta['response_assistant'][key] = copy.deepcopy(entry[key])
 
@@ -678,52 +678,59 @@ def chat_completions_common(body: dict, is_legacy: bool = False, stream=False, p
         _template_str = generate_params.get('instruction_template_str', '') if generate_params.get('mode') == 'instruct' else generate_params.get('chat_template_str', '')
         _tool_parsers, _, _ = detect_tool_call_format(_template_str)
 
-    for a in generator:
-        answer = a['internal'][-1][1]
+    try:
+        for a in generator:
+            answer = a['internal'][-1][1]
 
-        if supported_tools is not None:
-            tool_call = parse_tool_call(answer[end_last_tool_call:], supported_tools, parsers=_tool_parsers) if len(answer) > 0 else []
-            if len(tool_call) > 0:
-                for tc in tool_call:
-                    tc["id"] = get_tool_call_id()
-                    if stream:
-                        tc["index"] = len(tool_calls)
-                    tc["function"]["arguments"] = json.dumps(tc["function"]["arguments"])
-                    tool_calls.append(tc)
-                end_last_tool_call = len(answer)
+            if supported_tools is not None:
+                tool_call = parse_tool_call(answer[end_last_tool_call:], supported_tools, parsers=_tool_parsers) if len(answer) > 0 else []
+                if len(tool_call) > 0:
+                    for tc in tool_call:
+                        tc["id"] = get_tool_call_id()
+                        if stream:
+                            tc["index"] = len(tool_calls)
+                        tc["function"]["arguments"] = json.dumps(tc["function"]["arguments"])
+                        tool_calls.append(tc)
+                    end_last_tool_call = len(answer)
 
-        # Stop generation before streaming content if tool_calls were detected,
-        # so that raw tool markup is not sent as content deltas.
-        if len(tool_calls) > 0:
-            break
+            # Stop generation before streaming content if tool_calls were detected,
+            # so that raw tool markup is not sent as content deltas.
+            if len(tool_calls) > 0:
+                break
 
-        if stream:
-            # Strip reasoning/thinking blocks so only final content is streamed.
-            # Reasoning is emitted separately as reasoning_content deltas.
-            reasoning, content = extract_reasoning(answer)
-            if reasoning is not None:
-                new_reasoning = reasoning[len(seen_reasoning):]
-                new_content = content[len(seen_content):]
-            else:
-                new_reasoning = None
-                new_content = answer[len(seen_content):]
+            if stream:
+                # Strip reasoning/thinking blocks so only final content is streamed.
+                # Reasoning is emitted separately as reasoning_content deltas.
+                reasoning, content = extract_reasoning(answer)
+                if reasoning is not None:
+                    new_reasoning = reasoning[len(seen_reasoning):]
+                    new_content = content[len(seen_content):]
+                else:
+                    new_reasoning = None
+                    new_content = answer[len(seen_content):]
 
-            if (not new_content and not new_reasoning) or chr(0xfffd) in (new_content or '') + (new_reasoning or ''):
-                continue
+                if (not new_content and not new_reasoning) or chr(0xfffd) in (new_content or '') + (new_reasoning or ''):
+                    continue
 
-            chunk = chat_streaming_chunk(
-                content=new_content if new_content else None,
-                reasoning_content=new_reasoning if new_reasoning else None,
-            )
-            if include_usage:
-                chunk['usage'] = None
+                chunk = chat_streaming_chunk(
+                    content=new_content if new_content else None,
+                    reasoning_content=new_reasoning if new_reasoning else None,
+                )
+                if include_usage:
+                    chunk['usage'] = None
 
-            if reasoning is not None:
-                seen_reasoning = reasoning
-                seen_content = content
-            else:
-                seen_content = answer
-            yield chunk
+                if reasoning is not None:
+                    seen_reasoning = reasoning
+                    seen_content = content
+                else:
+                    seen_content = answer
+                yield chunk
+    finally:
+        # Responses can stop as soon as a complete tool call is recognized.
+        # Release the backend job before yielding the terminal API events,
+        # including when the consumer closes or generation raises.
+        if generate_params.get('_responses_raise_errors'):
+            generator.close()
 
     response_metrics = generate_params.get('_responses_metrics', {})
     if 'prompt_tokens' in response_metrics:

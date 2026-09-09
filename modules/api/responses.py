@@ -3,17 +3,21 @@
 History is bounded, process-local CPU memory; it never manages the model KV cache.
 """
 import copy
+import asyncio
 import json
 import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections import deque
+from contextlib import asynccontextmanager
 from typing import Literal
 
 from pydantic import ConfigDict, Field
 
 from .errors import InvalidRequestError
 from .typing import ChatCompletionRequest, GenerationOptions
+from .responses_tools import ToolOutputError, custom_function, custom_input, strict_validator
 
 
 class ResponsesRequest(GenerationOptions):
@@ -40,6 +44,7 @@ class ResponsesRequest(GenerationOptions):
     user: str | None = None
     safety_identifier: str | None = None
     prompt_cache_key: str | None = None
+    prompt_cache_retention: Literal['in-memory', '24h'] | None = None
     stream_options: dict | None = None
     client_metadata: dict | None = None
 
@@ -66,8 +71,10 @@ class ResponseStore:
                 self._drop(key)
 
     def put(self, response, history):
-        data = {'response': response, 'history': history}
-        size = len(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        # Stored snapshots are never mutated. Copy outside the lock so a large
+        # context does not block unrelated lookups/deletions while copying.
+        data = copy.deepcopy({'response': response, 'history': history})
+        size = len(json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
         if size > self.max_bytes:
             invalid('Response history exceeds the local storage limit; use store=false.', 'store', 413)
         with self.lock:
@@ -76,15 +83,20 @@ class ResponseStore:
                 self._drop(response['id'])
             while self.entries and (len(self.entries) >= self.max_entries or self.bytes + size > self.max_bytes):
                 self._drop(next(iter(self.entries)))
-            self.entries[response['id']] = (self.clock() + self.ttl, size, copy.deepcopy(data))
+            self.entries[response['id']] = (self.clock() + self.ttl, size, data)
             self.bytes += size
 
-    def get(self, response_id):
+    def get(self, response_id, *, field=None):
         with self.lock:
             self._expire()
             if response_id not in self.entries:
                 invalid('Response not found, expired, evicted, or created with store=false.', 'response_id', 404)
-            return copy.deepcopy(self.entries[response_id][2])
+            data = self.entries[response_id][2]
+            if field is not None:
+                data = data[field]
+        # A reference keeps this immutable snapshot alive even if another
+        # request deletes/evicts it after we release the lock.
+        return copy.deepcopy(data)
 
     def delete(self, response_id):
         with self.lock:
@@ -96,6 +108,42 @@ class ResponseStore:
 
 
 STORE = ResponseStore()
+
+
+class GenerationQueue:
+    """FIFO admission for Responses generation, without touching KV tensors."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.waiters = deque()
+
+    @asynccontextmanager
+    async def slot(self, stop_event):
+        loop = asyncio.get_running_loop()
+        ticket = loop.create_future()
+        with self.lock:
+            self.waiters.append(ticket)
+            if len(self.waiters) == 1:
+                ticket.set_result(True)
+        try:
+            # Waiting uses no inference/threadpool worker. Cancellation checking
+            # must not cancel/re-enqueue the ticket, which would break FIFO.
+            while not ticket.done() and not stop_event.is_set():
+                await asyncio.wait([ticket], timeout=0.1)
+            yield not stop_event.is_set()
+        finally:
+            with self.lock:
+                self.waiters.remove(ticket)
+                if self.waiters and not self.waiters[0].done():
+                    next_ticket = self.waiters[0]
+                    next_ticket.get_loop().call_soon_threadsafe(self._wake, next_ticket)
+
+    @staticmethod
+    def _wake(ticket):
+        if not ticket.done():
+            ticket.set_result(True)
+
+
+GENERATION_QUEUE = GenerationQueue()
 
 
 class GenerationMetrics(dict):
@@ -128,8 +176,8 @@ def function_definitions(tools):
             _fields(tool, 'type name description tools', 'tools')
             namespace = _string(tool, 'name', 'tools')
             nested = tool.get('tools')
-            if not isinstance(nested, list) or any(not isinstance(t, dict) or t.get('type') != 'function' for t in nested):
-                invalid('Namespaces currently support function tools only.', 'tools')
+            if not isinstance(nested, list) or any(not isinstance(t, dict) or t.get('type') not in ('function', 'custom') for t in nested):
+                invalid('Namespaces support function and custom tools only.', 'tools')
             for function in nested:
                 name = _string(function, 'name', 'tools')
                 yield {**function, 'name': namespace + '.' + name}
@@ -138,8 +186,27 @@ def function_definitions(tools):
 
 
 def output_call(request, call_id, name, arguments):
+    if request.tool_choice == 'none':
+        raise ToolOutputError('The model generated a tool call despite tool_choice=none.')
     item = {'type': 'function_call', 'id': 'fc_' + uuid.uuid4().hex,
             'call_id': call_id, 'name': name, 'arguments': arguments, 'status': 'completed'}
+    for tool in function_definitions(request.tools):
+        if tool.get('name') == name:
+            if tool['type'] == 'custom':
+                try:
+                    item.update(type='custom_tool_call', input=custom_input(tool, arguments))
+                except ValueError as exc:
+                    raise ToolOutputError(str(exc)) from exc
+                item.pop('arguments')
+                item.pop('status')
+            elif tool.get('strict'):
+                try:
+                    strict_validator(tool).validate(json.loads(arguments))
+                except Exception as exc:
+                    raise ToolOutputError('Generated function arguments failed strict schema validation for ' + name + '.') from exc
+            break
+    else:
+        raise ToolOutputError('The model generated an undeclared tool: ' + str(name))
     for tool in request.tools:
         if tool.get('type') == 'namespace':
             for function in tool.get('tools', []):
@@ -147,6 +214,17 @@ def output_call(request, call_id, name, arguments):
                     item.update(namespace=tool['name'], name=function['name'])
                     return item
     return item
+
+
+def output_calls(request, calls):
+    # Validate the whole batch before putting any executable item on the wire
+    # or in a failed response's output array.
+    if not request.parallel_tool_calls and len(calls) > 1:
+        raise ToolOutputError('The model generated multiple calls with parallel_tool_calls=false; no calls were delivered.')
+    ids = [call['id'] for call in calls]
+    if any(not cid for cid in ids) or len(set(ids)) != len(ids):
+        raise ToolOutputError('The model generated missing or duplicate tool call IDs.')
+    return [output_call(request, call['id'], call['name'], call['arguments']) for call in calls]
 
 
 def _content(value, role, param):
@@ -194,20 +272,27 @@ def input_messages(items):
             role = item.get('role')
             if role not in ('user', 'assistant', 'system', 'developer'):
                 invalid('Unsupported message role.', param)
-            messages.append({'role': role, 'content': _content(item.get('content'), role, param)})
-        elif kind == 'function_call':
-            _fields(item, 'type id call_id name arguments status namespace', param)
+            message = {'role': role, 'content': _content(item.get('content'), role, param)}
+            if item.get('phase') is not None:
+                if role != 'assistant' or item['phase'] not in ('commentary', 'final_answer'):
+                    invalid('phase is only supported for assistant commentary/final_answer.', param)
+                message['phase'] = item['phase']
+            messages.append(message)
+        elif kind in ('function_call', 'custom_tool_call'):
+            _fields(item, 'type id call_id name arguments status namespace' if kind == 'function_call'
+                    else 'type id call_id name input namespace', param)
             name = _string(item, 'name', param)
             if item.get('namespace') is not None:
                 name = _string(item, 'namespace', param) + '.' + name
             call = {'id': _string(item, 'call_id', param), 'type': 'function',
                     'function': {'name': name,
-                                 'arguments': _string(item, 'arguments', param, True)}}
+                                 'arguments': (_string(item, 'arguments', param, True) if kind == 'function_call'
+                                               else json.dumps({'input': _string(item, 'input', param, True)}, ensure_ascii=False))}}
             if messages and messages[-1]['role'] == 'assistant':
                 messages[-1].setdefault('tool_calls', []).append(call)
             else:
                 messages.append({'role': 'assistant', 'content': '', 'tool_calls': [call]})
-        elif kind == 'function_call_output':
+        elif kind in ('function_call_output', 'custom_tool_call_output'):
             _fields(item, 'type id call_id output status', param)
             messages.append({'role': 'tool', 'tool_call_id': _string(item, 'call_id', param),
                              'content': _content(item.get('output'), 'tool', param)})
@@ -217,6 +302,8 @@ def input_messages(items):
                 invalid('Encrypted reasoning cannot be used by a local model.', param)
             # Local reasoning items carry plaintext content, not a fabricated summary.
             content = item.get('content') or []
+            if not isinstance(content, list):
+                invalid('Reasoning content must be an array.', param)
             if item.get('summary') or any(not isinstance(p, dict) or p.get('type') != 'reasoning_text' for p in content):
                 invalid('Only local reasoning_text items can be replayed.', param)
             thinking = ''.join(_string(p, 'text', param, True) for p in content)
@@ -226,9 +313,12 @@ def input_messages(items):
     # Coalesce adjacent assistant reasoning/text/function items into one model turn.
     merged = []
     for message in messages:
-        if merged and message['role'] == merged[-1]['role'] == 'assistant':
+        if (merged and message['role'] == merged[-1]['role'] == 'assistant'
+                and not (message.get('phase') and merged[-1].get('phase') and message['phase'] != merged[-1]['phase'])):
             prior = merged[-1]
             prior['content'] += message['content']
+            if message.get('phase'):
+                prior['phase'] = message['phase']
             if message.get('reasoning_content'):
                 prior['reasoning_content'] = prior.get('reasoning_content', '') + message['reasoning_content']
             if message.get('tool_calls'):
@@ -239,7 +329,11 @@ def input_messages(items):
 
 
 def prepare(request, store=STORE):
-    body = request.model_dump()
+    # input/tools are normalized below; do not serialize the entire long
+    # context a second time just to extract generation options.
+    body = request.model_dump(include=set(GenerationOptions.model_fields) | {'temperature', 'top_p'})
+    if request.prompt_cache_retention == '24h':
+        invalid('The local KV cache cannot guarantee 24-hour retention; use in-memory.', 'prompt_cache_retention')
     if request.background:
         invalid('Background Responses are not implemented.', 'background')
     if set(request.include) - {'reasoning.encrypted_content'}:
@@ -266,17 +360,27 @@ def prepare(request, store=STORE):
         invalid('metadata allows 16 keys, key length <=64 and value length <=512.', 'metadata')
     if request.tool_choice not in ('auto', 'none'):
         invalid('Only auto/none tool_choice is supported; forced tool selection is not enforced by this backend.', 'tool_choice')
-    if not request.parallel_tool_calls:
-        invalid('parallel_tool_calls=false cannot be enforced by this backend.', 'parallel_tool_calls')
     tools = []
     names = set()
     for index, tool in enumerate(function_definitions(request.tools)):
         param = f'tools.{index}'
+        if tool.get('type') == 'custom':
+            _fields(tool, 'type name description format', param)
+            _string(tool, 'name', param)
+            if tool.get('description') is not None:
+                _string(tool, 'description', param, True)
+            try:
+                tool = custom_function(tool)
+            except Exception as exc:
+                invalid('Invalid or unsupported custom tool format: ' + str(exc).splitlines()[0], param)
         if tool.get('type') != 'function':
             invalid('Only client-executed function tools are supported. In Codex set web_search="disabled" '
                     'to stop advertising OpenAI hosted web search.', param)
         if tool.get('strict') is True:
-            invalid('Strict function schemas are not enforced; use strict=false.', param + '.strict')
+            try:
+                strict_validator(tool)
+            except Exception as exc:
+                invalid('Invalid or unsupported strict tool schema: ' + str(exc).splitlines()[0], param)
         if tool.get('strict') is not None and type(tool['strict']) is not bool:
             invalid('strict must be a boolean or null.', param + '.strict')
         if tool.get('description') is not None and not isinstance(tool['description'], str):
@@ -294,13 +398,14 @@ def prepare(request, store=STORE):
 
     history = []
     if request.previous_response_id:
-        previous = store.get(request.previous_response_id)
-        history = previous['history']
+        history = store.get(request.previous_response_id, field='history')
     history.extend(input_messages(request.input))
     if not history:
         invalid('input or previous_response_id must provide at least one message.')
     calls, results = set(), set()
     for message in history:
+        if calls != results and message['role'] != 'tool':
+            invalid('Return all pending function_call_output items before starting another message or tool turn.')
         for call in message.get('tool_calls', []):
             if call['id'] in calls:
                 invalid('Duplicate function call_id.')
@@ -315,6 +420,8 @@ def prepare(request, store=STORE):
     messages = copy.deepcopy(history)
     if request.instructions is not None:
         messages.insert(0, {'role': 'system', 'content': request.instructions})
+    if tools and request.tool_choice != 'none' and not request.parallel_tool_calls:
+        messages.insert(0, {'role': 'system', 'content': 'Call at most one tool per response. Wait for its result before calling another tool.'})
     verbosity = (request.text or {}).get('verbosity')
     if verbosity in ('low', 'high'):
         messages.insert(0, {'role': 'system', 'content': (
@@ -382,8 +489,8 @@ def from_chat(request, chat, history, store=STORE):
     if message.get('reasoning_content'):
         response['output'].append({'type': 'reasoning', 'id': 'rs_' + uuid.uuid4().hex, 'summary': [],
                                    'content': [{'type': 'reasoning_text', 'text': message['reasoning_content']}]})
-    for call in message.get('tool_calls', []):
-        response['output'].append(output_call(request, call['id'], call['function']['name'], call['function']['arguments']))
+    response['output'].extend(output_calls(request, [
+        {'id': call['id'], **call['function']} for call in message.get('tool_calls', [])]))
     if message.get('content') or not response['output']:
         response['output'].append(message_item(message.get('content') or '', 'incomplete' if choice['finish_reason'] == 'length' else 'completed'))
     complete_response(response, choice['finish_reason'], chat.get('usage'))
@@ -405,7 +512,9 @@ class StreamConverter:
         self.pending_text = ''
 
     def event(self, kind, **data):
-        event = {'type': kind, 'sequence_number': self.sequence, **copy.deepcopy(data)}
+        # json.dumps snapshots values immediately; a deep copy here only adds
+        # work for complete output items and long terminal responses.
+        event = {'type': kind, 'sequence_number': self.sequence, **data}
         self.sequence += 1
         return {'event': kind, 'data': json.dumps(event, ensure_ascii=False)}
 
@@ -473,16 +582,18 @@ class StreamConverter:
         events = []
         if self.calls:
             # Calls are assembled first; backend may only identify them at the end.
-            for call in self.calls.values():
-                if not call['id'] or not call['name']:
-                    raise RuntimeError('Incomplete backend function call')
-                item = output_call(self.request, call['id'], call['name'], call['arguments'])
+            for item in output_calls(self.request, list(self.calls.values())):
                 index = len(self.response['output'])
                 self.response['output'].append(item)
-                events.append(self.event('response.output_item.added', output_index=index,
-                                         item={**item, 'arguments': '', 'status': 'in_progress'}))
-                events.append(self.event('response.function_call_arguments.delta', output_index=index, item_id=item['id'], delta=item['arguments']))
-                events.append(self.event('response.function_call_arguments.done', output_index=index, item_id=item['id'], arguments=item['arguments'], name=item['name']))
+                if item['type'] == 'custom_tool_call':
+                    events.append(self.event('response.output_item.added', output_index=index, item={**item, 'input': ''}))
+                    events.append(self.event('response.custom_tool_call_input.delta', output_index=index, item_id=item['id'], delta=item['input']))
+                    events.append(self.event('response.custom_tool_call_input.done', output_index=index, item_id=item['id'], input=item['input']))
+                else:
+                    events.append(self.event('response.output_item.added', output_index=index,
+                                             item={**item, 'arguments': '', 'status': 'in_progress'}))
+                    events.append(self.event('response.function_call_arguments.delta', output_index=index, item_id=item['id'], delta=item['arguments']))
+                    events.append(self.event('response.function_call_arguments.done', output_index=index, item_id=item['id'], arguments=item['arguments'], name=item['name']))
                 events.append(self.event('response.output_item.done', output_index=index, item=item))
         elif self.pending_text or not self.response['output']:
             events.extend(self.add_text(self.pending_text))

@@ -1,0 +1,4 @@
+# Responses custom tool grammars and strict function schema validation.
+lark==1.2.2
+jsonschema>=4.23,<5
+regex>=2024.11.6
