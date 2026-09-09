@@ -414,13 +414,18 @@ def generate_chat_prompt(user_input, state, **kwargs):
 
         row_idx = len(history) - i - 1
 
-        if tool_msg:
+        if tool_msg or entry_meta.get('response_tool'):
             tool_message = {"role": "tool", "content": tool_msg}
             if "tool_call_id" in entry_meta:
                 tool_message["tool_call_id"] = entry_meta["tool_call_id"]
             messages.insert(insert_pos, tool_message)
 
-        if not assistant_msg and entry_meta.get('tool_calls'):
+        if 'response_assistant' in entry_meta:
+            message = copy.deepcopy(entry_meta['response_assistant'])
+            if message.get('tool_calls'):
+                message['tool_calls'] = _deserialize_tool_call_arguments(message['tool_calls'])
+            messages.insert(insert_pos, message)
+        elif not assistant_msg and entry_meta.get('tool_calls'):
             # Assistant message with only tool_calls and no text content
             messages.insert(insert_pos, {"role": "assistant", "content": "", "tool_calls": _deserialize_tool_call_arguments(entry_meta['tool_calls'])})
         elif assistant_msg:
@@ -679,6 +684,11 @@ def generate_chat_prompt(user_input, state, **kwargs):
     if shared.tokenizer is not None:
         max_length = get_max_prompt_length(state)
         encoded_length = get_encoded_length(prompt)
+        if state.get('_responses_no_truncation') and encoded_length > max_length:
+            from modules.api.errors import InvalidRequestError
+            raise InvalidRequestError(
+                f'Input exceeds the available context ({encoded_length} tokens, {max_length} available). '
+                'Shorten input or explicitly request truncation="auto".', 'input')
         while len(messages) > 0 and encoded_length > max_length:
 
             if len(messages) > 2 and messages[0]['role'] == 'system':

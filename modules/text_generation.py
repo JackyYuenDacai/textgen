@@ -503,12 +503,15 @@ def generate_reply_HF(question, original_question, state, stopping_strings=None,
 
     except Exception:
         logger.exception("Failed to generate reply (HF)")
+        if state.get('_responses_raise_errors'):
+            raise
     finally:
         t1 = time.time()
         original_tokens = len(original_input_ids[0])
         new_tokens = len(output) - (original_tokens if not shared.is_seq2seq else 0)
         logger.info(f'Output generated in {(t1-t0):.2f} seconds ({new_tokens/(t1-t0):.2f} tokens/s, {new_tokens} tokens, context {original_tokens}, seed {seed})')
-        return
+        if not state.get('_responses_raise_errors'):
+            return
 
 
 def generate_reply_custom(question, original_question, state, stopping_strings=None, is_chat=False):
@@ -536,6 +539,8 @@ def generate_reply_custom(question, original_question, state, stopping_strings=N
 
     except Exception:
         logger.exception("Failed to generate reply (custom)")
+        if state.get('_responses_raise_errors'):
+            raise
     finally:
         t1 = time.time()
 
@@ -547,7 +552,8 @@ def generate_reply_custom(question, original_question, state, stopping_strings=N
             new_tokens = len(encode(original_question + reply)[0]) - original_tokens
 
         logger.info(f'Output generated in {(t1-t0):.2f} seconds ({new_tokens/(t1-t0):.2f} tokens/s end-to-end, {new_tokens} tokens, context {original_tokens}, seed {state["seed"]})')
-        return
+        if not state.get('_responses_raise_errors'):
+            return
 
 
 def print_prompt(prompt, max_chars=-1):

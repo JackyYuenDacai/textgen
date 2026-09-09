@@ -1,6 +1,6 @@
 ## OpenAI/Anthropic-compatible API
 
-The main API for this project is meant to be a drop-in replacement for the OpenAI and Anthropic APIs, including Chat, Completions, and Messages endpoints.
+The main API for this project provides OpenAI and Anthropic compatibility, including Chat, Completions, Messages, and a local subset of the Responses API.
 
 * It is 100% offline and private.
 * It doesn't create any logs.
@@ -41,6 +41,170 @@ previous turn's tail; it does not guarantee a full-history cache hit.
 For the documentation with all the endpoints, parameters and their types, consult `http://127.0.0.1:5000/docs` or the [typing.py](https://github.com/oobabooga/textgen/blob/main/modules/api/typing.py) file.
 
 The official examples in the [OpenAI documentation](https://platform.openai.com/docs/api-reference) should also work, and the same parameters apply (although the API here has more optional parameters).
+
+#### Responses
+
+`POST /v1/responses` uses the loaded model and the same generation backend as
+Chat Completions. Existing Chat and Anthropic endpoints remain available. After
+installing this code, restart TextGen normally to register the new routes.
+The `model` field does not load or switch models; the response identifies the
+model actually loaded. These routes use the existing `--api-key` authentication.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:5000/v1", api_key="yourkey")
+response = client.responses.create(
+    model="local",
+    instructions="Answer briefly.",
+    input="Explain what a KV cache does.",
+    max_output_tokens=256,
+)
+print(response.output_text)
+
+followup = client.responses.create(
+    model="local",
+    previous_response_id=response.id,
+    input="How does it help the next turn?",
+    max_output_tokens=256,
+)
+print(followup.output_text)
+```
+
+Input may be a string or an array of messages with `user`, `assistant`, `system`,
+or `developer` roles. Content supports `input_text`, assistant `output_text`, and
+user `input_image` with an HTTP(S) URL or image data URL. Image support depends on
+the loaded model. Uploaded `file_id`, audio, and video inputs are not implemented.
+Top-level `instructions` apply only to the current response and are not inherited
+through `previous_response_id`; send them again when needed. Explicit system
+messages in `input` remain in the stored history.
+
+Streaming uses named Responses SSE events, including `response.created`,
+`response.output_text.delta`, `response.output_item.done`, and a terminal
+`response.completed`, `response.incomplete`, or `response.failed`. There is no
+Chat-style `[DONE]` marker. Handle all three terminal states:
+
+```python
+events = client.responses.create(
+    model="local", input="Hello", stream=True, store=False, max_output_tokens=128,
+)
+for event in events:
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="", flush=True)
+    elif event.type == "response.incomplete":
+        print("\nIncomplete:", event.response.incomplete_details.reason)
+    elif event.type == "response.failed":
+        print("\nFailed:", event.response.error.message)
+```
+
+The SDK's `responses.stream()` helper also works for completed responses. In
+openai-python 3.10.0, `get_final_response()` requires `response.completed`; read
+the `response.incomplete` or `response.failed` event directly in those cases.
+Disconnecting cancels the generation and does not save a partial response.
+
+Function tools use the flat Responses schema and are executed by the client:
+
+```python
+tools = [{
+    "type": "function", "name": "get_temperature", "strict": False,
+    "description": "Read a temperature sensor.",
+    "parameters": {"type": "object", "properties": {}},
+}]
+response = client.responses.create(model="local", input="Read the temperature.", tools=tools)
+outputs = []
+for item in response.output:
+    if item.type == "function_call":
+        # Validate the name and arguments, then execute your own implementation.
+        # This example supplies a simulated measurement.
+        if item.name == "get_temperature":
+            outputs.append({"type": "function_call_output", "call_id": item.call_id,
+                            "output": '{"celsius": 25}'})
+if outputs:
+    response = client.responses.create(model="local", previous_response_id=response.id,
+                                       input=outputs, tools=tools)
+    print(response.output_text)
+```
+
+Return an output for every pending function call. `call_id` identifies the call;
+it differs from the output item's `id`. Both `tool_choice="auto"` and `"none"`
+are supported. The backend detects tool calls after generating their markup,
+so when tools are enabled, text and function arguments are buffered until the
+result is known. Plain-text requests without tools stream incrementally.
+
+`store` defaults to `true`. Stored responses and history live only in CPU RAM,
+with a one-hour TTL, at most 64 responses, and a 64 MiB total serialized-size
+budget. Oldest entries are evicted when limits are reached; a single history
+over the budget returns an error (use `store=false`). This budget counts text
+and embedded image data, not GPU KV tensors. Restarting clears stored history.
+All callers with access to this API share this storage; it is not per-user
+storage. Treat response IDs as private conversation references.
+
+- `GET /v1/responses/{response_id}` retrieves a stored result.
+- `DELETE /v1/responses/{response_id}` deletes that stored result.
+- `store=false` supports stateless operation: replay prior input, `response.output`,
+  and new input items in the next request.
+
+Response storage does not purge or resize the GPU KV cache. Context capacity
+remains controlled by the loaded model and existing generation settings.
+`truncation="disabled"` (default) rejects oversized input instead of silently
+discarding its prefix, including when ExLlamaV3 image embeddings exceed the
+loaded capacity. Explicit `truncation="auto"` uses the existing backend clipping
+behavior. `max_output_tokens` is an output ceiling; available context and EOS may
+end generation earlier.
+
+This is a compatibility subset, not every OpenAI hosted feature:
+
+- Hosted tools, background jobs, Conversations, WebSockets, response compaction,
+  uploaded files, strict JSON schemas, forced tool selection, and enforcement of
+  `parallel_tool_calls=false` are not implemented. Unsupported request fields and
+  unsupported tool types return errors.
+- Local reasoning is exposed as plaintext `reasoning_text`; no encrypted content
+  or summaries are generated. Codex's `include=["reasoning.encrypted_content"]`
+  and `reasoning.summary` preferences are accepted, but the response explicitly
+  reports `reasoning.summary=null` and carries only available plaintext reasoning.
+  Replaying encrypted content from a hosted model remains unsupported.
+  `reasoning.effort` is passed to the chat template, whose support varies by model.
+- Function tool namespaces are flattened for the local template and restored as
+  `namespace`/`name` in response items. `text.verbosity` becomes a concise/detailed
+  answer instruction, not an enforced length constraint.
+- Usage totals come from the Chat backend. Unknown cache and reasoning token
+  breakdowns are omitted, so clients requiring strict validation of every hosted
+  usage field are not supported. Standard SDK parsing is supported. ExLlamaV3
+  Responses use request-local generated token counts and native finish reasons,
+  including speculative output limits; available cached-token counts are included.
+- `user`, `safety_identifier`, and `prompt_cache_key` are accepted for client
+  compatibility; they do not provide identity isolation, moderation, or a new
+  caching policy. Service tiers only accept `auto`/`default` with local behavior.
+  Codex's `client_metadata` is also accepted as inert client metadata; it is not
+  inserted into the prompt or used as authorization.
+
+##### Codex configuration
+
+The route is enabled automatically with `--api`; there is no separate Responses
+switch on TextGen. A Codex provider must use `wire_api="responses"` and a base URL
+ending in `/v1`. For a local-only Codex profile, use:
+
+```toml
+model_provider = "textgen"
+model = "Qwen3.8-27B-EXL3-3.5bpw" # Replace with your loaded model name.
+web_search = "disabled"          # TextGen has no OpenAI-hosted search service.
+
+[model_providers.textgen]
+name = "TextGen"
+base_url = "http://127.0.0.1:5000/v1"
+wire_api = "responses"
+```
+
+This can be placed in a separate Codex profile rather than replacing your other
+provider settings. If you enable TextGen API authentication, configure the
+provider's `env_key` to reference an environment variable containing that key.
+Function-based client tools are supported; hosted web search, custom grammar
+tools, and encrypted history from a different provider are not. Start a new
+conversation when switching from a hosted reasoning model to the local model.
+Validation errors identify the rejected field in both `error.message` and
+`error.param`, including when the client UI displays only the message.
+
+Protocol reference: [OpenAI official Responses API documentation](https://developers.openai.com/api/reference/resources/responses/methods/create).
 
 #### Chat completions
 

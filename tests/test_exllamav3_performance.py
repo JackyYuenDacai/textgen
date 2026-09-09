@@ -313,6 +313,32 @@ class GenerationTests(unittest.TestCase):
             self.model.generate('prompt', self.state)
         self.assertEqual(job.call_args.kwargs['max_new_tokens'], 4)
 
+    def test_responses_overflow_rejected_before_job_submission(self):
+        from modules.api.errors import InvalidRequestError
+        self.model.generator.max_total_tokens = 1024
+        self.model.tokenizer.encode = Mock(return_value=torch.ones((1, 1500), dtype=torch.long))
+        self.state.update(truncation_length=4096, _responses_no_truncation=True)
+        with self.assertRaises(InvalidRequestError):
+            self.model.generate('prompt with expanded image tokens', self.state)
+        self.model.parallel_generator.submit.assert_not_called()
+
+    def test_responses_request_local_usage_survives_copy_and_uses_terminal_count(self):
+        from modules.api.responses import GenerationMetrics
+        counters = GenerationMetrics()
+        self.state['_responses_metrics'] = counters
+        self.events({'eos': True, 'text': 'One, two,', 'token_ids': torch.tensor([[1, 2, 3, 4]]),
+                     'new_tokens': 4, 'cached_tokens': 2, 'eos_reason': 'max_new_tokens'})
+        self.model.generate('prompt', copy.deepcopy(self.state))
+        self.assertEqual(counters, {'prompt_tokens': 3, 'completion_tokens': 4,
+                                   'cached_tokens': 2, 'finish_reason': 'length'})
+        self.assertEqual(GenerationMetrics(), {})
+
+    def test_responses_worker_failure_is_not_a_successful_empty_output(self):
+        self.state['_responses_raise_errors'] = True
+        self.events(None)
+        with self.assertRaisesRegex(RuntimeError, 'without a terminal result'):
+            self.model.generate('prompt', self.state)
+
     def test_output_ceiling_does_not_truncate_a_prompt_that_fits(self):
         self.model.generator.max_total_tokens = 221184
         self.model.generator.num_draft_tokens = 4

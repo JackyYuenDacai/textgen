@@ -568,6 +568,11 @@ class Exllamav3Model:
             'loader_dropped_tokens': max(0, original_prompt_tokens - max_prompt_length),
         }
         if original_prompt_tokens > max_prompt_length:
+            if state.get('_responses_no_truncation'):
+                from modules.api.errors import InvalidRequestError
+                raise InvalidRequestError(
+                    f'Input including image embeddings exceeds the loaded context '
+                    f'({original_prompt_tokens} tokens, {max_prompt_length} available).', 'input')
             logger.warning(
                 f'ExLlamaV3 prompt truncated from {original_prompt_tokens} to {max_prompt_length} tokens '
                 'because it exceeds the loaded context capacity (including generation headroom). '
@@ -586,6 +591,9 @@ class Exllamav3Model:
 
         max_new_tokens = min(max_new_tokens, usable_context - self._last_prompt_token_count)
         metrics['prompt_budget']['effective_max_new_tokens'] = max_new_tokens
+        response_metrics = state.get('_responses_metrics')
+        if response_metrics is not None:
+            response_metrics.update(prompt_tokens=input_ids.shape[-1], completion_tokens=0)
 
         eos_ids = [eid for eid in self.config.eos_token_id_list if eid is not None]
 
@@ -635,6 +643,8 @@ class Exllamav3Model:
                 except queue.Empty:
                     continue
                 if result is None:
+                    if state.get('_responses_raise_errors'):
+                        raise RuntimeError('ExLlamaV3 worker ended without a terminal result.')
                     break
                 if result.get('eos'):
                     final_result = result
@@ -646,6 +656,14 @@ class Exllamav3Model:
                 if step_tokens is not None:
                     emitted_tokens += step_tokens.numel()
                     self.last_completion_token_count = emitted_tokens
+
+                if response_metrics is not None:
+                    response_metrics['completion_tokens'] = result.get('new_tokens', emitted_tokens)
+                    if result.get('eos'):
+                        response_metrics['finish_reason'] = (
+                            'length' if result.get('eos_reason') == 'max_new_tokens' else 'stop')
+                    if 'cached_tokens' in result:
+                        response_metrics['cached_tokens'] = result['cached_tokens']
 
                 if chunk:
                     if first_output_time is None:

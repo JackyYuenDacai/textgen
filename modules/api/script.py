@@ -20,6 +20,7 @@ import modules.api.completions as OAIcompletions
 import modules.api.logits as OAIlogits
 import modules.api.models as OAImodels
 import modules.api.anthropic as Anthropic
+import modules.api.responses as Responses
 from .tokens import token_count, token_decode, token_encode
 from .errors import OpenAIError
 from .utils import _start_cloudflared
@@ -134,6 +135,16 @@ async def anthropic_error_handler(request: Request, exc: AnthropicError):
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith('/v1/responses'):
+        error = exc.errors()[0]
+        param = '.'.join(str(part) for part in error['loc'] if part != 'body')
+        message = f"{param}: {error['msg']}"
+        if error['type'] == 'extra_forbidden':
+            message = f"Unsupported Responses request field: {param}."
+        logger.warning('Responses request validation rejected field %s (%s)', param, error['type'])
+        return JSONResponse(status_code=400, content={'error': {
+            'message': message, 'type': 'invalid_request_error', 'param': param, 'code': None
+        }})
     if request.url.path.startswith("/v1/messages"):
         messages = "; ".join(
             f"{'.'.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors()
@@ -251,6 +262,63 @@ async def openai_chat_completions(request: Request, request_data: ChatCompletion
             monitor.cancel()
 
         return JSONResponse(response)
+
+
+@app.post('/v1/responses', dependencies=check_key)
+async def openai_responses(request: Request, request_data: Responses.ResponsesRequest):
+    # Validate and resolve history before returning HTTP 200 / starting SSE.
+    converted, history = Responses.prepare(request_data)
+    stop_event = threading.Event()
+    if request_data.stream:
+        async def generator():
+            converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
+            response = OAIcompletions.stream_chat_completions(converted, stop_event=stop_event)
+            try:
+                for event in converter.start():
+                    yield event
+                async for chunk in iterate_in_threadpool(response):
+                    if stop_event.is_set():
+                        return
+                    for event in converter.process(chunk):
+                        yield event
+                if not stop_event.is_set():
+                    for event in converter.finish():
+                        yield event
+            except OpenAIError as error:
+                yield converter.failed(error.message, 'invalid_prompt' if error.code < 500 else 'server_error')
+            except Exception:
+                logger.exception('Responses generation failed')
+                yield converter.failed('Local generation failed; check the server log.')
+            finally:
+                stop_event.set()
+                response.close()
+        return GenerationEventSourceResponse(generator(), stop_event, sep='\n')
+
+    monitor = asyncio.create_task(_wait_for_disconnect(request, stop_event))
+    try:
+        result = await asyncio.to_thread(OAIcompletions.chat_completions, converted, stop_event=stop_event)
+        if stop_event.is_set():
+            # A disconnected request must not persist a partial generation as completed.
+            return JSONResponse(status_code=499, content={'error': {'message': 'Client disconnected', 'type': 'server_error', 'param': None, 'code': None}})
+        return JSONResponse(Responses.from_chat(request_data, result, history))
+    except OpenAIError:
+        raise
+    except Exception:
+        logger.exception('Responses generation failed')
+        raise OpenAIError('Local generation failed; check the server log.') from None
+    finally:
+        stop_event.set()
+        monitor.cancel()
+
+
+@app.get('/v1/responses/{response_id}', dependencies=check_key)
+async def retrieve_response(response_id: str):
+    return JSONResponse(Responses.STORE.get(response_id)['response'])
+
+
+@app.delete('/v1/responses/{response_id}', dependencies=check_key)
+async def delete_response(response_id: str):
+    return JSONResponse(Responses.STORE.delete(response_id))
 
 
 @app.post('/v1/messages', dependencies=check_anthropic_key)

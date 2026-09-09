@@ -402,7 +402,7 @@ def process_multimodal_content(content):
     return str(content)
 
 
-def convert_history(history):
+def convert_history(history, preserve_response_items=False):
     '''
     Chat histories in this program are in the format [message, reply].
     This function converts OpenAI histories to that format.
@@ -438,6 +438,12 @@ def convert_history(history):
                 if content.strip() == "":
                     content = ""  # keep empty content, don't skip
 
+            if preserve_response_items:
+                meta['response_assistant'] = {'role': 'assistant', 'content': content}
+                for key in ('reasoning_content', 'tool_calls'):
+                    if key in entry:
+                        meta['response_assistant'][key] = copy.deepcopy(entry[key])
+
             current_reply = content
             user_input_last = False
             if current_message:
@@ -452,6 +458,8 @@ def convert_history(history):
             meta = {}
             if "tool_call_id" in entry:
                 meta["tool_call_id"] = entry["tool_call_id"]
+            if preserve_response_items:
+                meta['response_tool'] = True  # Empty function output is still a tool result.
             chat_dialogue.append(['', '', content, meta])
         elif role in ("system", "developer"):
             if not seen_non_system:
@@ -558,7 +566,7 @@ def chat_completions_common(body: dict, is_legacy: bool = False, stream=False, p
     user_bio = body['user_bio'] or ''
 
     # History
-    user_input, custom_system_message, history = convert_history(messages)
+    user_input, custom_system_message, history = convert_history(messages, body.get('_responses_preserve_items', False))
 
     generate_params.update({
         'mode': body['mode'],
@@ -717,23 +725,34 @@ def chat_completions_common(body: dict, is_legacy: bool = False, stream=False, p
                 seen_content = answer
             yield chunk
 
-    token_count = shared.model.last_prompt_token_count if hasattr(shared.model, 'last_prompt_token_count') else 0
-    completion_token_count = len(encode(answer)[0])
+    response_metrics = generate_params.get('_responses_metrics', {})
+    if 'prompt_tokens' in response_metrics:
+        token_count = response_metrics['prompt_tokens']
+        completion_token_count = response_metrics['completion_tokens']
+    else:
+        token_count = shared.model.last_prompt_token_count if hasattr(shared.model, 'last_prompt_token_count') else 0
+        completion_token_count = len(encode(answer)[0])
     if len(tool_calls) > 0:
         stop_reason = "tool_calls"
+    elif response_metrics.get('finish_reason'):
+        stop_reason = response_metrics['finish_reason']
     elif token_count + completion_token_count >= generate_params['truncation_length'] or completion_token_count >= generate_params['max_new_tokens']:
         stop_reason = "length"
     else:
         stop_reason = "stop"
 
+    token_usage = {
+        'prompt_tokens': token_count,
+        'completion_tokens': completion_token_count,
+        'total_tokens': token_count + completion_token_count,
+    }
+    if 'cached_tokens' in response_metrics:
+        token_usage['prompt_tokens_details'] = {'cached_tokens': response_metrics['cached_tokens']}
+
     if stream:
         chunk = chat_streaming_chunk(chunk_tool_calls=tool_calls)
         chunk[resp_list][0]['finish_reason'] = stop_reason
-        usage = {
-            "prompt_tokens": token_count,
-            "completion_tokens": completion_token_count,
-            "total_tokens": token_count + completion_token_count
-        }
+        usage = token_usage
 
         if include_usage:
             chunk['usage'] = None
@@ -771,11 +790,7 @@ def chat_completions_common(body: dict, is_legacy: bool = False, stream=False, p
                 "message": message,
                 "logprobs": None,
             }],
-            "usage": {
-                "prompt_tokens": token_count,
-                "completion_tokens": completion_token_count,
-                "total_tokens": token_count + completion_token_count
-            }
+            "usage": token_usage
         }
         if logprob_proc:
             all_entries = []
