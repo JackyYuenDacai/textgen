@@ -179,6 +179,56 @@ class ImageCacheTests(unittest.TestCase):
         self.assertTrue(all([item.token_list for item, _ in result] == baseline for result in results))
 
 
+class PerformanceHistoryTests(unittest.TestCase):
+    def make_model(self, capacity=4096):
+        with patch.object(shared.args, 'exl3_performance_history', capacity):
+            model = Exllamav3Model()
+        model.generator = None
+        return model
+
+    def test_retains_more_than_32_requests_with_stable_sequences(self):
+        model = self.make_model()
+        for job_id in range(100):
+            model._record_performance({'job_id': job_id, 'completed': True})
+        stats = model.get_performance_stats()
+        self.assertEqual(len(stats['recent_requests']), 100)
+        self.assertEqual(stats['history']['capacity'], 4096)
+        self.assertEqual(stats['history']['dropped'], 0)
+        self.assertEqual(stats['recent_requests'][-1]['sequence'], 100)
+        self.assertIn('+00:00', stats['recent_requests'][-1]['recorded_at'])
+
+    def test_bounded_history_reports_eviction_and_copies_records(self):
+        model = self.make_model(40)
+        metrics = {'job_id': 1, 'completed': False}
+        for job_id in range(100):
+            metrics['job_id'] = job_id
+            model._record_performance(metrics)
+        stats = model.get_performance_stats()
+        self.assertEqual(stats['history']['dropped'], 60)
+        self.assertEqual(stats['history']['first_sequence'], 61)
+        self.assertEqual(stats['history']['last_sequence'], 100)
+        self.assertEqual(stats['recent_requests'][0]['job_id'], 60)
+        stats['recent_requests'][0]['job_id'] = -1
+        self.assertEqual(model.get_performance_stats()['recent_requests'][0]['job_id'], 60)
+
+    def test_session_changes_when_model_reloads_and_empty_history_is_valid(self):
+        first, second = self.make_model(), self.make_model()
+        self.assertNotEqual(first.performance_session, second.performance_session)
+        self.assertIsNone(first.get_performance_stats()['history']['first_sequence'])
+
+    def test_history_limit_must_be_positive(self):
+        for capacity in (0, -1):
+            with self.subTest(capacity=capacity), self.assertRaisesRegex(ValueError, 'positive'):
+                self.make_model(capacity)
+
+    def test_concurrent_recording_keeps_unique_monotonic_sequences(self):
+        model = self.make_model()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda job_id: model._record_performance({'job_id': job_id}), range(200)))
+        stats = model.get_performance_stats()
+        self.assertEqual([record['sequence'] for record in stats['recent_requests']], list(range(1, 201)))
+
+
 class GenerationTests(unittest.TestCase):
     def setUp(self):
         self.model = Exllamav3Model()
@@ -216,6 +266,10 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(metrics['decode_tokens_per_second'], 2.0)
         self.assertEqual(metrics['draft_acceptance'], 0.75)
         self.assertEqual(metrics['cached_tokens'], 768)
+        self.assertEqual(metrics['uncached_prompt_tokens'], 256)
+        self.assertEqual(metrics['prefill_tokens_per_second'], 512)
+        self.assertEqual(metrics['configuration']['max_chunk_size'], 2048)
+        self.assertIn('devices', metrics['memory_after'])
         self.assertTrue(metrics['completed'])
         self.model.parallel_generator.cancel.assert_called_once()
 

@@ -138,8 +138,12 @@ group.add_argument('--quant_type', type=str, default='nf4', help='quant_type for
 
 # ExLlamaV3
 group = parser.add_argument_group('ExLlamaV3')
+group.add_argument('--exl3-performance-history', type=int, default=4096, help='Number of completed or cancelled ExLlamaV3 request metrics retained in RAM (positive integer). Read-only monitoring can archive these across model reloads.')
 group.add_argument('--exl3-image-cache-mib', type=int, default=256, help='Maximum MiB of reusable ExLlamaV3 image embeddings. 0 disables reuse.')
 group.add_argument('--exl3-max-chunk-size', type=int, default=2048, help='ExLlamaV3 prompt processing chunk size, in multiples of 256. Larger values need more temporary VRAM.')
+group.add_argument('--exl3-recurrent-cache-mib', type=int, default=4096, help='System RAM budget in MiB for ExLlamaV3 recurrent checkpoints.')
+group.add_argument('--exl3-recurrent-checkpoint-interval', type=int, default=0, help='ExLlamaV3 checkpoint interval near prompt tail and during generation, multiple of 256. 0 uses the model architecture default.')
+group.add_argument('--exl3-recurrent-checkpoint-interval-pp', type=int, default=32768, help='ExLlamaV3 checkpoint interval during prefill, rounded up to a prompt chunk. Smaller values reduce branch replay but increase checkpoint copying.')
 group.add_argument('--gpu-split', type=str, help='Comma-separated list of VRAM (in GB) to use per GPU device for model layers. Example: 20,7,7.')
 group.add_argument('--enable-tp', '--enable_tp', action='store_true', help='Enable Tensor Parallelism (TP) to split the model across GPUs.')
 group.add_argument('--tp-backend', type=str, default='native', help='The backend for tensor parallelism. Valid options: native, nccl. Default: native.')

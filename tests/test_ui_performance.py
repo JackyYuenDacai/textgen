@@ -7,6 +7,24 @@ with patch('sys.argv', ['textgen-tests']):
 
 
 class PerformanceDashboardTests(unittest.TestCase):
+    def test_memory_labels_handle_old_records_and_escape_device_names(self):
+        self.assertEqual(ui_performance._memory_label({}, 'allocated_bytes'), 'N/A')
+        record = {'memory_after': {'devices': [
+            {'device': '<test>', 'allocated_bytes': 2 * 1024**2},
+            {'device': 1, 'error': 'unavailable'}]}}
+        self.assertEqual(ui_performance._memory_label(record, 'allocated_bytes'), 'GPU &lt;test&gt;: 2 MiB')
+
+    def test_large_history_keeps_dashboard_bounded_without_hiding_retained_count(self):
+        records = [{'job_id': job_id, 'completed': True, 'new_tokens': 4,
+                    'time_generate': 1, 'time_prefill': 0.5} for job_id in range(120)]
+        model = SimpleNamespace(get_performance_stats=lambda: {'recent_requests': records})
+        with patch.object(ui_performance.shared, 'model', model), \
+             patch.object(ui_performance.shared, 'model_name', 'test-model'), \
+             patch.object(ui_performance.shared.args, 'loader', 'ExLlamav3'):
+            output = ui_performance.render_performance_dashboard()
+        self.assertIn('Latest 100 of 120 retained requests', output)
+        self.assertEqual(len(records), 120)
+
     def test_populated_dashboard_renders_metrics_charts_and_escaped_model_name(self):
         stats = {
             'recent_requests': [

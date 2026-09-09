@@ -34,7 +34,8 @@ class DraftingTests(unittest.TestCase):
     def test_controls_are_persisted_and_exl3_only(self):
         with patch('sys.argv', ['textgen-tests']):
             from modules import loaders, shared
-        for key in ('exl3_dynamic_draft', 'exl3_draft_confidence'):
+        for key in ('exl3_dynamic_draft', 'exl3_draft_confidence', 'exl3_image_cache_mib', 'exl3_max_chunk_size',
+                    'exl3_recurrent_cache_mib', 'exl3_recurrent_checkpoint_interval', 'exl3_recurrent_checkpoint_interval_pp'):
             self.assertIn(key, loaders.list_model_elements())
             self.assertIn(key, loaders.loaders_and_params['ExLlamav3'])
             self.assertNotIn(key, loaders.loaders_and_params['llama.cpp'])
@@ -48,6 +49,30 @@ class DraftingTests(unittest.TestCase):
         ])
         self.assertAlmostEqual(result['decode_tps'], 400 / 7)
         self.assertEqual(result['end_to_end_tps'], 40)
+
+    def test_checkpoint_and_chunk_controls_reach_loader_and_saved_config(self):
+        import tempfile
+        from pathlib import Path
+        import yaml
+        with patch('sys.argv', ['textgen-tests']):
+            from modules import loaders, shared
+            from modules.models_settings import save_model_settings, update_model_parameters
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(**vars(shared.args))
+            args.model_dir = directory
+            state = {key: getattr(args, key, None) for key in loaders.list_model_elements()}
+            state.update(loader='ExLlamav3', ctx_size=240000, exl3_max_chunk_size=4096,
+                         exl3_recurrent_cache_mib=4096, exl3_recurrent_checkpoint_interval=2048,
+                         exl3_recurrent_checkpoint_interval_pp=8192)
+            with patch.object(shared, 'args', args), patch.object(shared, 'user_config', {}), \
+                    patch.object(shared, 'load_user_config', return_value={}):
+                update_model_parameters(state)
+                list(save_model_settings('test-model', state))
+            saved = yaml.safe_load((Path(directory) / 'config-user.yaml').read_text())['test-model$']
+            for key in ('ctx_size', 'exl3_max_chunk_size', 'exl3_recurrent_cache_mib',
+                        'exl3_recurrent_checkpoint_interval', 'exl3_recurrent_checkpoint_interval_pp'):
+                self.assertEqual(saved[key], state[key])
+                self.assertEqual(getattr(args, key), state[key])
 
 
 if __name__ == '__main__':

@@ -169,6 +169,16 @@ def _latency_chart(records):
     '''
 
 
+def _memory_label(record, field):
+    devices = (record.get('memory_after') or {}).get('devices') or []
+    labels = []
+    for device in devices:
+        value = _number(device.get(field))
+        if value is not None:
+            labels.append(f"GPU {device.get('device')}: {value / 1024**2:,.0f} MiB")
+    return html.escape('; '.join(labels) or 'N/A')
+
+
 def _history_table(records):
     rows = []
     for record in reversed(records):
@@ -188,6 +198,11 @@ def _history_table(records):
                 <td>{_format_integer(record.get('prompt_tokens'))}</td>
                 <td>{_format_integer(record.get('cached_tokens'))}</td>
                 <td>{_format_percent(record.get('draft_acceptance'))}</td>
+                <td>{_format_integer((record.get('configuration') or {}).get('max_chunk_size'))}</td>
+                <td>{_format_number(record.get('prefill_tokens_per_second'), suffix=' tok/s')}</td>
+                <td>{_memory_label(record, 'allocated_bytes')}</td>
+                <td>{_memory_label(record, 'reserved_bytes')}</td>
+                <td>{_memory_label(record, 'device_free_bytes')}</td>
             </tr>
         ''')
 
@@ -198,6 +213,7 @@ def _history_table(records):
                     <th>Job</th><th>Status</th><th>Decode</th><th>End-to-end</th>
                     <th>Prefill</th><th>First output</th><th>Output</th><th>Prompt</th>
                     <th>Cached</th><th>Draft accepted</th>
+                    <th>Chunk</th><th>Uncached prefill rate</th><th>Allocated at exit</th><th>Reserved at exit</th><th>Device free at exit</th>
                 </tr></thead>
                 <tbody>{''.join(rows)}</tbody>
             </table>
@@ -249,6 +265,7 @@ def render_performance_dashboard():
         '''
 
     latest = records[-1]
+    displayed_records = records[-100:]
     completed = [record for record in records if record.get('completed')]
     latest_completed = completed[-1] if completed else latest
     cache = performance.get('image_cache') or {}
@@ -289,7 +306,7 @@ def render_performance_dashboard():
             <div class="perf-chart-grid">
                 <article class="perf-panel">
                     <div class="perf-panel-heading"><h2>Throughput trend</h2><p>Completed requests</p></div>
-                    {_line_chart(records)}
+                    {_line_chart(displayed_records)}
                 </article>
                 <article class="perf-panel">
                     <div class="perf-panel-heading"><h2>Latency by job</h2><p>Latest 16 completed requests</p></div>
@@ -299,9 +316,9 @@ def render_performance_dashboard():
             <article class="perf-panel perf-history">
                 <div class="perf-panel-heading">
                     <h2>Request history</h2>
-                    <p>Up to 32 requests · chunk size {_format_integer(performance.get('max_chunk_size'))}</p>
+                    <p>Latest {len(displayed_records)} of {len(records)} retained requests · chunk size {_format_integer(performance.get('max_chunk_size'))}</p>
                 </div>
-                {_history_table(records)}
+                {_history_table(displayed_records)}
             </article>
         </section>
     '''

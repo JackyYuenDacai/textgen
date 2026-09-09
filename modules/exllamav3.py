@@ -5,8 +5,10 @@ import re
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Tuple
+from uuid import uuid4
 
 import torch
 
@@ -30,6 +32,7 @@ from exllamav3.generator.sampler import (
 from modules import shared
 from modules.exllamav3_cache import ImageEmbeddingCache
 from modules.exllamav3_drafting import drafting_options
+from modules.exllamav3_diagnostics import memory_snapshot, recurrent_options, recurrent_snapshot
 from modules.exllamav3_prefill import PrefillJobMixin
 from modules.image_utils import (
     convert_image_attachments_to_pil,
@@ -147,6 +150,9 @@ class ConcurrentGenerator:
                     job = result["job"]
                     q = self.job_queues.get(job)
                     if q:
+                        if result.get('eos'):
+                            # Sample mutable checkpoint state under the generator lock.
+                            result['recurrent_cache'] = recurrent_snapshot(self.generator)
                         q.put(result)
                         if result.get("eos"):
                             self.job_queues.pop(job, None)
@@ -178,9 +184,14 @@ class ConcurrentGenerator:
 class Exllamav3Model:
 
     def __init__(self):
+        history_limit = shared.args.exl3_performance_history
+        if history_limit < 1:
+            raise ValueError('exl3-performance-history must be a positive integer.')
         self.image_cache = ImageEmbeddingCache(shared.args.exl3_image_cache_mib * 1024**2)
-        self.performance_history = deque(maxlen=32)
+        self.performance_history = deque(maxlen=history_limit)
         self.performance_lock = threading.Lock()
+        self.performance_session = uuid4().hex
+        self.performance_sequence = 0
 
     @staticmethod
     def _cache_settings(cache_type):
@@ -204,6 +215,7 @@ class Exllamav3Model:
         path_to_model = Path(f'{shared.args.model_dir}') / Path(path_to_model)
         layer_type, cache_kwargs = cls._cache_settings(shared.args.cache_type)
         adaptive_options = drafting_options(shared.args, Generator)
+        checkpoint_options = recurrent_options(shared.args)
         chunk_size = int(shared.args.exl3_max_chunk_size)
         if chunk_size < 256 or chunk_size % 256:
             raise ValueError('exl3-max-chunk-size must be a positive multiple of 256.')
@@ -332,6 +344,7 @@ class Exllamav3Model:
             draft_cache=draft_cache,
             num_draft_tokens=shared.args.draft_max if draft_model is not None else 0,
             max_chunk_size=chunk_size,
+            **checkpoint_options,
             **adaptive_options,
         )
 
@@ -353,6 +366,20 @@ class Exllamav3Model:
             'confidence': shared.args.exl3_draft_confidence if adaptive_options else None,
         }
         logger.info(f'ExLlamaV3 drafting: {result.drafting_info}')
+        from exllamav3.modules.attention_fn import triton_paged
+        result.performance_configuration = {
+            'cache_type': shared.args.cache_type,
+            'recurrent_cache_mib': shared.args.exl3_recurrent_cache_mib,
+            'staging_mode': getattr(triton_paged, '_qc_staging', None),
+            'staging_bucket_pages': getattr(triton_paged, '_qc_staging_bucket_pages', 0),
+            'drafting': dict(result.drafting_info),
+        }
+        logger.info(
+            f'ExLlamaV3 prefill: chunk {chunk_size}, checkpoint interval '
+            f'{generator.recurrent_checkpoint_interval_pp}, checkpoint RAM '
+            f'{shared.args.exl3_recurrent_cache_mib} MiB, staging bucket '
+            f"{result.performance_configuration['staging_bucket_pages']} pages"
+        )
 
         return result, result
 
@@ -423,13 +450,23 @@ class Exllamav3Model:
         """
 
         request_start = time.perf_counter()
-        metrics = {'image_cache_hits': 0, 'image_cache_misses': 0}
+        metrics = {'image_cache_hits': 0, 'image_cache_misses': 0,
+                   'started_at': datetime.now(timezone.utc).isoformat()}
+        metrics['memory_before'] = memory_snapshot(torch.cuda)
+        metrics['configuration'] = {
+            **getattr(self, 'performance_configuration', {'cache_type': shared.args.cache_type}),
+            'max_chunk_size': self.generator.max_chunk_size,
+            'context_capacity': self.generator.max_total_tokens,
+            'recurrent_checkpoint_interval': getattr(self.generator, 'recurrent_checkpoint_interval', None),
+            'recurrent_checkpoint_interval_pp': getattr(self.generator, 'recurrent_checkpoint_interval_pp', None),
+        }
+        image_start = time.perf_counter()
         if shared.is_multimodal:
             # Process images and modify prompt (ExLlamaV3-specific)
             prompt, image_embeddings = self._process_images_for_generation(prompt, state, metrics)
         else:
             image_embeddings = []
-        metrics['image_seconds'] = time.perf_counter() - request_start
+        metrics['image_seconds'] = time.perf_counter() - image_start
 
         # Greedy decoding is a special case
         if state['temperature'] == 0:
@@ -582,12 +619,16 @@ class Exllamav3Model:
                 if chunk:
                     if first_output_time is None:
                         first_output_time = time.perf_counter()
+                        metrics['memory_first_output'] = memory_snapshot(torch.cuda)
                     response_text += chunk
                     yield response_text
                 if final_result is not None:
                     break
         finally:
             self.parallel_generator.cancel(job)
+            # On cancellation the worker may still be in flight. This is an
+            # observation at consumer exit, not proof that GPU cleanup finished.
+            metrics['memory_after'] = memory_snapshot(torch.cuda)
             metrics.update(
                 job_id=getattr(job, 'serial_number', None),
                 completed=final_result is not None,
@@ -601,6 +642,14 @@ class Exllamav3Model:
                     if key in final_result:
                         metrics[key] = final_result[key]
                 gen_time = metrics.get('time_generate', 0)
+                metrics['recurrent_cache'] = final_result.get('recurrent_cache')
+                prompt_tokens = metrics.get('prompt_tokens')
+                cached_tokens = metrics.get('cached_tokens')
+                if prompt_tokens is not None and cached_tokens is not None:
+                    metrics['uncached_prompt_tokens'] = max(0, prompt_tokens - cached_tokens)
+                    prefill_seconds = metrics.get('time_prefill', 0)
+                    metrics['prefill_tokens_per_second'] = (
+                        metrics['uncached_prompt_tokens'] / prefill_seconds if prefill_seconds > 0 else None)
                 metrics['decode_tokens_per_second'] = metrics.get('new_tokens', 0) / gen_time if gen_time > 0 else None
                 accepted = metrics.get('accepted_draft_tokens', 0)
                 attempted = accepted + metrics.get('rejected_draft_tokens', 0)
@@ -618,13 +667,25 @@ class Exllamav3Model:
                     f"cached {metrics.get('cached_tokens', 0)}/{metrics.get('prompt_tokens', 0)} tokens, "
                     f"draft acceptance {acceptance_label} ({accepted}/{attempted})"
                 )
-            with self.performance_lock:
-                self.performance_history.append(metrics)
+            self._record_performance(metrics)
+
+    def _record_performance(self, metrics):
+        with self.performance_lock:
+            self.performance_sequence += 1
+            self.performance_history.append(dict(metrics, sequence=self.performance_sequence,
+                                                 recorded_at=datetime.now(timezone.utc).isoformat()))
 
     def get_performance_stats(self):
         with self.performance_lock:
             recent = [dict(item) for item in self.performance_history]
+            history = {'session_id': self.performance_session,
+                       'capacity': self.performance_history.maxlen,
+                       'retained': len(recent), 'total_recorded': self.performance_sequence,
+                       'dropped': self.performance_sequence - len(recent),
+                       'first_sequence': recent[0]['sequence'] if recent else None,
+                       'last_sequence': recent[-1]['sequence'] if recent else None}
         return {'recent_requests': recent, 'image_cache': self.image_cache.info(),
+                'history': history,
                 'drafting': dict(getattr(self, 'drafting_info', {})),
                 'max_chunk_size': self.generator.max_chunk_size if self.generator else None}
 

@@ -360,6 +360,7 @@ bitsandbytes 4-bit:
   --quant_type QUANT_TYPE                              quant_type for 4-bit. Valid options: nf4, fp4.
 
 ExLlamaV3:
+  --exl3-performance-history EXL3_PERFORMANCE_HISTORY   Number of request metrics retained in RAM (default 4096; positive integer). Read through GET /v1/internal/model/info without generating inference traffic.
   --gpu-split GPU_SPLIT                                Comma-separated list of VRAM (in GB) to use per GPU device for model layers. Example: 20,7,7.
   --enable-tp, --enable_tp                             Enable Tensor Parallelism (TP) to split the model across GPUs.
   --tp-backend TP_BACKEND                              The backend for tensor parallelism. Valid options: native, nccl. Default: native.
