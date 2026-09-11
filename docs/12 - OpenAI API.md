@@ -155,6 +155,10 @@ copies only the history. Large copies occur outside the storage lock, and
 request preparation/retrieval run outside the HTTP event loop.
 
 - `GET /v1/responses/{response_id}` retrieves a stored result.
+- `GET /v1/responses/{response_id}/input_items` lists the stored input items. It
+  supports `after`, `limit` (1–100), `order=asc|desc`, and the same supported
+  `include` values as Responses creation. Results use immutable item IDs, so a
+  client can page through long conversations safely.
 - `DELETE /v1/responses/{response_id}` deletes that stored result.
 - `store=false` supports stateless operation: replay prior input, `response.output`,
   and new input items in the next request.

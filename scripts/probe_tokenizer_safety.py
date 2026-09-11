@@ -24,9 +24,13 @@ def main():
     parser.add_argument('--model-dir', required=True)
     parser.add_argument('--tokens', type=int, default=220000)
     parser.add_argument('--rounds', type=int, default=4)
+    parser.add_argument('--synthetic-images', type=int, default=40,
+                        help='Use 0 to encode a single unsplit long text prompt.')
     args = parser.parse_args()
     if args.tokens < 1 or args.rounds < 1:
         parser.error('--tokens and --rounds must be positive')
+    if args.synthetic_images < 0:
+        parser.error('--synthetic-images must be nonnegative')
     faulthandler.enable(all_threads=True)
     tokenizer = Tokenizer(SimpleNamespace(
         directory=args.model_dir, bos_token_id=None, eos_token_id=None,
@@ -39,8 +43,8 @@ def main():
     # Synthetic embeddings exercise alias splitting and billion-range IDs;
     # they do not run the vision encoder or allocate any VRAM.
     embeddings = [MMEmbedding(embeddings=torch.zeros(2, 4),
-                              token_string=torch.tensor([[-1, -1]])) for _ in range(40)]
-    stride = max(1, len(text) // len(embeddings))
+                              token_string=torch.tensor([[-1, -1]])) for _ in range(args.synthetic_images)]
+    stride = max(1, len(text) // max(1, len(embeddings)))
     chunks = [text[i:i + stride] for i in range(0, len(text), stride)]
     prompt = ''.join(chunk + (embeddings[i].text_alias if i < len(embeddings) else '')
                      for i, chunk in enumerate(chunks)) + special

@@ -7,9 +7,10 @@ import threading
 import traceback
 from collections import deque
 from threading import Thread
+from typing import Literal
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.requests import Request
@@ -137,7 +138,7 @@ async def anthropic_error_handler(request: Request, exc: AnthropicError):
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     if request.url.path.startswith('/v1/responses'):
         error = exc.errors()[0]
-        param = '.'.join(str(part) for part in error['loc'] if part != 'body')
+        param = '.'.join(str(part) for part in error['loc'] if part not in ('body', 'query', 'path'))
         message = f"{param}: {error['msg']}"
         if error['type'] == 'extra_forbidden':
             message = f"Unsupported Responses request field: {param}."
@@ -331,6 +332,16 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
     finally:
         stop_event.set()
         monitor.cancel()
+
+
+@app.get('/v1/responses/{response_id}/input_items', dependencies=check_key)
+async def list_response_input_items(response_id: str, after: str | None = None,
+                                    limit: int = Query(default=20, ge=1, le=100),
+                                    order: Literal['asc', 'desc'] = 'desc',
+                                    include: list[str] | None = Query(default=None),
+                                    include_brackets: list[str] | None = Query(default=None, alias='include[]', include_in_schema=False)):
+    return await asyncio.to_thread(lambda: JSONResponse(Responses.STORE.input_items(
+        response_id, after=after, limit=limit, order=order, include=(include or []) + (include_brackets or []))))
 
 
 @app.get('/v1/responses/{response_id}', dependencies=check_key)

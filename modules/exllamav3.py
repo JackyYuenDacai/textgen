@@ -544,12 +544,24 @@ class Exllamav3Model:
 
             sampler = CustomSampler(ordered_samplers)
 
-        input_ids = self.tokenizer.encode(
-            prompt,
-            add_bos=state['add_bos_token'],
-            encode_special_tokens=True,
-            embeddings=image_embeddings,
-        )
+        # tokenizers' native Rust implementation can dereference freed memory
+        # on very large single-string inputs on Windows (the failure is a hard
+        # process crash, so it cannot be caught in Python). Encode long text in
+        # bounded pieces and concatenate the IDs before handing them to ExLlama.
+        # Multimodal prompts must remain one call because aliases carry spans.
+        if not image_embeddings and len(prompt) > 16384:
+            pieces = [prompt[i:i + 16384] for i in range(0, len(prompt), 16384)]
+            encoded = [self.tokenizer.encode(piece, add_bos=(state['add_bos_token'] and i == 0),
+                                              encode_special_tokens=True)
+                       for i, piece in enumerate(pieces)]
+            input_ids = torch.cat(encoded, dim=1)
+        else:
+            input_ids = self.tokenizer.encode(
+                prompt,
+                add_bos=state['add_bos_token'],
+                encode_special_tokens=True,
+                embeddings=image_embeddings,
+            )
 
         cache_headroom = 1 + self.generator.num_draft_tokens
         usable_context = min(state['truncation_length'], self.generator.max_total_tokens - cache_headroom)

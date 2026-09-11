@@ -70,10 +70,11 @@ class ResponseStore:
             if expires <= now:
                 self._drop(key)
 
-    def put(self, response, history):
+    def put(self, response, history, *, input_count=None):
         # Stored snapshots are never mutated. Copy outside the lock so a large
         # context does not block unrelated lookups/deletions while copying.
-        data = copy.deepcopy({'response': response, 'history': history})
+        data = copy.deepcopy({'response': response, 'history': history,
+                              'input_count': len(history) if input_count is None else input_count})
         size = len(json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
         if size > self.max_bytes:
             invalid('Response history exceeds the local storage limit; use store=false.', 'store', 413)
@@ -86,17 +87,42 @@ class ResponseStore:
             self.entries[response['id']] = (self.clock() + self.ttl, size, data)
             self.bytes += size
 
-    def get(self, response_id, *, field=None):
+    def _snapshot(self, response_id):
         with self.lock:
             self._expire()
             if response_id not in self.entries:
                 invalid('Response not found, expired, evicted, or created with store=false.', 'response_id', 404)
-            data = self.entries[response_id][2]
-            if field is not None:
-                data = data[field]
+            return self.entries[response_id][2]
+
+    def get(self, response_id, *, field=None):
+        data = self._snapshot(response_id)
+        if field is not None:
+            data = data[field]
         # A reference keeps this immutable snapshot alive even if another
         # request deletes/evicts it after we release the lock.
         return copy.deepcopy(data)
+
+    def input_items(self, response_id, *, after=None, limit=20, order='desc', include=None):
+        if type(limit) is not int or not 1 <= limit <= 100:
+            invalid('limit must be between 1 and 100.', 'limit')
+        if order not in ('asc', 'desc'):
+            invalid('order must be asc or desc.', 'order')
+        if set(include or []) - {'message.input_image.image_url', 'message.output_text.logprobs', 'reasoning.encrypted_content'}:
+            invalid('Additional include fields are not implemented.', 'include')
+        snapshot = self._snapshot(response_id)
+        items, count = snapshot['history'], snapshot['input_count']
+        indices = range(count) if order == 'asc' else range(count - 1, -1, -1)
+        if after is not None:
+            position = next((i for i, index in enumerate(indices) if items[index]['id'] == after), None)
+            if position is None:
+                invalid('after must identify an input item in this response.', 'after')
+            indices = indices[position + 1:]
+        # Immutable snapshots remain alive across deletion/eviction. Copy only
+        # this page, outside the lock, never the whole long-context history.
+        page = copy.deepcopy([items[index] for index in indices[:limit]])
+        return {'object': 'list', 'data': page, 'has_more': len(indices) > limit,
+                'first_id': page[0]['id'] if page else None,
+                'last_id': page[-1]['id'] if page else None}
 
     def delete(self, response_id):
         with self.lock:
@@ -108,6 +134,41 @@ class ResponseStore:
 
 
 STORE = ResponseStore()
+
+
+def canonical_input_items(value, previous=()):
+    """Preserve wire items before lossy conversion to backend chat messages."""
+    raw = [{'role': 'user', 'content': value}] if isinstance(value, str) else value
+    items = []
+    ids = {item['id'] for item in previous}
+    for index, original in enumerate(raw):
+        item = copy.deepcopy(original)
+        kind = item.setdefault('type', 'message')
+        if item.get('id') is None:
+            prefix = {'message': 'msg_', 'reasoning': 'rs_', 'function_call': 'fc_',
+                      'custom_tool_call': 'ctc_'}.get(kind, 'item_')
+            item['id'] = prefix + uuid.uuid4().hex
+        identity = _string(item, 'id', f'input.{index}.id')
+        if identity in ids:
+            invalid('Duplicate input item id.', f'input.{index}.id')
+        ids.add(identity)
+        if kind == 'message':
+            if isinstance(item['content'], str):
+                part_type = 'output_text' if item['role'] == 'assistant' else 'input_text'
+                item['content'] = [{'type': part_type, 'text': item['content']}]
+            for part in item['content']:
+                if item['role'] == 'assistant' and part['type'] == 'input_text':
+                    part['type'] = 'output_text'
+                if part['type'] == 'output_text':
+                    part.setdefault('annotations', [])
+                    part.setdefault('logprobs', [])
+                elif part['type'] == 'input_image':
+                    part.setdefault('detail', 'auto')
+            item.setdefault('status', 'completed')
+        elif kind == 'reasoning':
+            item.setdefault('summary', [])
+        items.append(item)
+    return items
 
 
 class GenerationQueue:
@@ -399,11 +460,13 @@ def prepare(request, store=STORE):
     history = []
     if request.previous_response_id:
         history = store.get(request.previous_response_id, field='history')
-    history.extend(input_messages(request.input))
-    if not history:
+    # Validate before canonicalizing. Keep the public item types and IDs for
+    # retrieval; only the generation path needs flattened chat messages.
+    messages = input_messages(history) + input_messages(request.input)
+    if not messages:
         invalid('input or previous_response_id must provide at least one message.')
     calls, results = set(), set()
-    for message in history:
+    for message in messages:
         if calls != results and message['role'] != 'tool':
             invalid('Return all pending function_call_output items before starting another message or tool turn.')
         for call in message.get('tool_calls', []):
@@ -417,7 +480,7 @@ def prepare(request, store=STORE):
             results.add(cid)
     if calls != results:
         invalid('Supply function_call_output for every pending function call before continuing.')
-    messages = copy.deepcopy(history)
+    history.extend(canonical_input_items(request.input, history))
     if request.instructions is not None:
         messages.insert(0, {'role': 'system', 'content': request.instructions})
     if tools and request.tool_choice != 'none' and not request.parallel_tool_calls:
@@ -479,7 +542,7 @@ def complete_response(response, finish_reason, token_usage):
 
 def save_response(request, response, history, store=STORE):
     if request.store:
-        store.put(response, history + input_messages(response['output']))
+        store.put(response, history + response['output'], input_count=len(history))
 
 
 def from_chat(request, chat, history, store=STORE):

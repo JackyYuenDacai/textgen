@@ -118,6 +118,132 @@ class ResponsesTests(unittest.TestCase):
                 {'role': 'user', 'content': 'New turn before result'},
                 {'type': 'function_call_output', 'call_id': 'c', 'output': 'done'}]), self.store)
 
+    def test_input_items_paginate_repeated_messages_in_both_orders(self):
+        raw = [{'role': 'user', 'content': 'Again'} for _ in range(23)]
+        request = api.ResponsesRequest(input=raw, instructions='Separate instructions')
+        _, history = api.prepare(request, self.store)
+        result = api.from_chat(request, chat_result('Not an input'), history, self.store)
+        all_items = self.store.input_items(result['id'], order='asc', limit=100)['data']
+        ids = [item['id'] for item in all_items]
+        self.assertEqual(len(set(ids)), 23)
+        self.assertEqual(all_items[0]['content'], [{'type': 'input_text', 'text': 'Again'}])
+        self.assertNotIn('Not an input', json.dumps(all_items))
+        self.assertNotIn('Separate instructions', json.dumps(all_items))
+        self.assertEqual(raw, [{'role': 'user', 'content': 'Again'} for _ in range(23)])
+        default_page = self.store.input_items(result['id'])
+        self.assertEqual([item['id'] for item in default_page['data']], ids[::-1][:20])
+        self.assertTrue(default_page['has_more'])
+        for order, expected in [('asc', ids), ('desc', ids[::-1])]:
+            collected, cursor = [], None
+            while True:
+                page = self.store.input_items(result['id'], after=cursor, order=order, limit=5)
+                self.assertEqual(page['first_id'], page['data'][0]['id'])
+                self.assertEqual(page['last_id'], page['data'][-1]['id'])
+                collected.extend(item['id'] for item in page['data'])
+                cursor = page['last_id']
+                if not page['has_more']:
+                    break
+            self.assertEqual(collected, expected)
+            self.assertEqual(self.store.input_items(result['id'], after=cursor, order=order), {
+                'object': 'list', 'data': [], 'first_id': None, 'last_id': None, 'has_more': False})
+        for options in ({'after': ''}, {'after': result['output'][0]['id']}, {'limit': 0},
+                        {'limit': 101}, {'order': 'sideways'}, {'include': ['file_search_call.results']}):
+            with self.subTest(options=options), self.assertRaises(InvalidRequestError):
+                self.store.input_items(result['id'], **options)
+
+    def test_input_items_preserve_custom_tools_reasoning_images_and_replay(self):
+        raw = [
+            {'role': 'user', 'content': [{'type': 'input_image', 'image_url': 'data:image/png;base64,AA=='}]},
+            {'type': 'reasoning', 'content': [{'type': 'reasoning_text', 'text': 'Inspect it'}]},
+            {'role': 'assistant', 'phase': 'commentary', 'content': 'Checking'},
+            {'type': 'custom_tool_call', 'call_id': 'patch', 'namespace': 'editor', 'name': 'patch', 'input': 'raw code'},
+            {'type': 'custom_tool_call_output', 'call_id': 'patch', 'output': ''},
+            {'type': 'function_call', 'call_id': 'read', 'name': 'read', 'arguments': '{}'},
+            {'type': 'function_call_output', 'call_id': 'read', 'output': [
+                {'type': 'input_text', 'text': 'Result'}, {'type': 'input_image', 'image_url': 'data:image/png;base64,BB=='}]},
+        ]
+        original = copy.deepcopy(raw)
+        request = api.ResponsesRequest(input=raw)
+        body, history = api.prepare(request, self.store)
+        result = api.from_chat(request, chat_result(), history, self.store)
+        page = self.store.input_items(result['id'], order='asc', include=['message.input_image.image_url'])
+        items = page['data']
+        self.assertEqual([item['type'] for item in items], [
+            'message', 'reasoning', 'message', 'custom_tool_call', 'custom_tool_call_output',
+            'function_call', 'function_call_output'])
+        self.assertEqual(items[1]['content'], raw[1]['content'])
+        self.assertEqual(items[2]['phase'], 'commentary')
+        self.assertEqual(items[3]['namespace'], 'editor')
+        self.assertEqual(items[3]['input'], 'raw code')
+        self.assertEqual(items[4]['output'], '')
+        self.assertEqual(items[6]['output'], raw[6]['output'])
+        self.assertEqual(len({item['id'] for item in items}), len(raw))
+        replay, _ = api.prepare(api.ResponsesRequest(input=items), self.store)
+        self.assertEqual(replay['messages'], body['messages'])
+        self.assertEqual(raw, original)
+
+    def test_input_items_chain_survives_parent_delete_and_preserves_ids(self):
+        req = api.ResponsesRequest(input='First', instructions='Old')
+        _, history = api.prepare(req, self.store)
+        first = api.from_chat(req, chat_result('First answer'), history, self.store)
+        first_inputs = self.store.input_items(first['id'], order='asc')['data']
+        follow = api.ResponsesRequest(input='Next', previous_response_id=first['id'], instructions='New')
+        _, history = api.prepare(follow, self.store)
+        self.store.delete(first['id'])
+        second = api.from_chat(follow, chat_result('Second answer'), history, self.store)
+        items = self.store.input_items(second['id'], order='asc')['data']
+        self.assertEqual(items[:2], first_inputs + first['output'])
+        self.assertEqual(items[2]['content'][0]['text'], 'Next')
+        self.assertEqual(len(items), 3)
+        with self.assertRaises(InvalidRequestError):
+            self.store.input_items(second['id'], after=second['output'][0]['id'])
+        # Stored output item IDs remain stable even after their parent is gone.
+        self.assertEqual(self.store.input_items(second['id'], after=first['output'][0]['id'], order='asc')['data'], items[2:])
+
+    def test_input_items_copy_only_page_and_obey_storage_lifetime(self):
+        now = [0]
+        store = api.ResponseStore(max_entries=1, ttl=10, clock=lambda: now[0])
+        request = api.ResponsesRequest(input=[{'role': 'user', 'content': str(i)} for i in range(30)])
+        _, history = api.prepare(request, store)
+        result = api.from_chat(request, chat_result(), history, store)
+        with patch.object(api.copy, 'deepcopy', wraps=copy.deepcopy) as copying:
+            page = store.input_items(result['id'], limit=1)
+        self.assertEqual(copying.call_count, 1)
+        self.assertEqual(len(copying.call_args.args[0]), 1)
+        page['data'][0]['content'][0]['text'] = 'Mutated'
+        self.assertEqual(store.input_items(result['id'], limit=1)['data'][0]['content'][0]['text'], '29')
+        size = len(json.dumps(store.get(result['id']), ensure_ascii=False, separators=(',', ':')).encode())
+        self.assertEqual(store.bytes, size)
+        now[0] = 11
+        with self.assertRaises(InvalidRequestError):
+            store.input_items(result['id'])
+        self.assertEqual(store.bytes, 0)
+        result = api.from_chat(request, chat_result(), history, store)
+        newer = api.from_chat(request, chat_result(), history, store)
+        with self.assertRaises(InvalidRequestError):
+            store.input_items(result['id'])
+        store.delete(newer['id'])
+        with self.assertRaises(InvalidRequestError):
+            store.input_items(newer['id'])
+        request.store = False
+        transient = api.from_chat(request, chat_result(), history, store)
+        with self.assertRaises(InvalidRequestError):
+            store.input_items(transient['id'])
+
+    def test_input_item_ids_validate_and_page_can_be_replayed(self):
+        for raw in ([{'role': 'user', 'content': 'Hi', 'id': 42}],
+                    [{'role': 'user', 'content': 'Hi', 'id': 'same'}] * 2):
+            with self.assertRaises(InvalidRequestError):
+                api.prepare(api.ResponsesRequest(input=raw), self.store)
+        request = api.ResponsesRequest(input=[{'role': 'assistant', 'content': 'Hello', 'id': 'msg_original'}])
+        body, history = api.prepare(request, self.store)
+        result = api.from_chat(request, chat_result(), history, self.store)
+        items = self.store.input_items(result['id'])['data']
+        self.assertEqual(items[0]['id'], 'msg_original')
+        self.assertEqual(items[0]['content'][0]['type'], 'output_text')
+        replay, _ = api.prepare(api.ResponsesRequest(input=items), self.store)
+        self.assertEqual(body['messages'], replay['messages'])
+
     def test_prompt_cache_options_do_not_change_model_input(self):
         a, _ = api.prepare(api.ResponsesRequest(input='Stable prompt', client_metadata={'turn': 'a'},
                            prompt_cache_key='one', prompt_cache_retention='in-memory'), self.store)
@@ -285,6 +411,7 @@ class ResponsesTests(unittest.TestCase):
         self.assertEqual(data[-1]['type'], 'response.completed')
         self.assertEqual(result['usage']['input_tokens'], 10)
         self.assertEqual(self.store.get(result['id'])['response'], result)
+        self.assertEqual(self.store.input_items(result['id'])['data'][0]['content'][0]['text'], 'Hi')
 
     def test_stream_tools_buffer_raw_markup_and_assemble_arguments(self):
         req = api.ResponsesRequest(input='Hi', tools=[{'type': 'function', 'name': 'f', 'strict': False}], store=False)
