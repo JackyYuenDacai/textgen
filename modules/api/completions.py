@@ -303,6 +303,11 @@ def completions_common(body: dict, is_legacy: bool = False, stream=False, stop_e
 
 def chat_completions_common(body, is_legacy=False, stream=False, prompt_only=False, stop_event=None):
     body = dict(body)
+    # Preserve the established monkey-patching/extension seam: generation
+    # resolves backend hooks through this adapter's namespace.
+    generation.generate_chat_reply = generate_chat_reply
+    generation.parse_tool_call = parse_tool_call
+    generation.get_tool_call_id = get_tool_call_id
     if 'items' not in body:
         if 'messages' not in body:
             raise InvalidRequestError(message='messages is required', param='messages')
