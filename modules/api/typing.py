@@ -145,8 +145,7 @@ class CompletionResponse(BaseModel):
     usage: dict
 
 
-class ChatCompletionRequestParams(BaseModel):
-    messages: List[dict] = Field(..., min_length=1)
+class GenerationRequestParams(BaseModel):
     model: str | None = Field(default=None, description="Unused parameter. To change the model, use the /v1/internal/model/load endpoint.")
     frequency_penalty: float | None = shared.args.frequency_penalty
     function_call: str | dict | None = Field(default=None, description="Unused parameter.")
@@ -189,6 +188,14 @@ class ChatCompletionRequestParams(BaseModel):
     chat_instruct_command: str | None = "Continue the chat dialogue below. Write a single reply for the character \"<|character|>\".\n\n<|prompt|>"
 
     continue_: bool = Field(default=False, description="Makes the last bot message in the history be continued instead of starting a new message.")
+
+
+class GenerationRequestOptions(GenerationOptions, GenerationRequestParams):
+    pass
+
+
+class ChatCompletionRequestParams(GenerationRequestParams):
+    messages: List[dict] = Field(..., min_length=1)
 
 
 class ChatCompletionRequest(GenerationOptions, ChatCompletionRequestParams):

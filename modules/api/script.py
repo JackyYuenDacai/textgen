@@ -4,6 +4,7 @@ import logging
 import os
 import socket
 import threading
+import time
 import traceback
 from collections import deque
 from threading import Thread
@@ -265,6 +266,11 @@ async def openai_chat_completions(request: Request, request_data: ChatCompletion
         return JSONResponse(response)
 
 
+# How often a queued streaming request announces itself while waiting for
+# the single local generation slot.
+RESPONSES_QUEUE_PING_SECONDS = 15.0
+
+
 @app.post('/v1/responses', dependencies=check_key)
 async def openai_responses(request: Request, request_data: Responses.ResponsesRequest):
     # Validate and resolve history before returning HTTP 200 / starting SSE.
@@ -273,13 +279,26 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
     if request_data.stream:
         async def generator():
             converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
-            async with Responses.GENERATION_QUEUE.slot(stop_event) as admitted:
-                if not admitted:
+            for event in converter.created():
+                yield event
+            ticket = await Responses.GENERATION_QUEUE.acquire()
+            try:
+                # The local model serves one generation at a time. A queued
+                # request keeps its stream alive and announces itself instead
+                # of hanging, so clients can follow up (for example with a
+                # tool result) as soon as it is admitted.
+                async for _ in Responses.GENERATION_QUEUE.wait(ticket, stop_event, RESPONSES_QUEUE_PING_SECONDS):
+                    for event in converter.queued():
+                        yield event
+                if stop_event.is_set():
+                    # A client waiting in the queue must not hang on an empty
+                    # stream when the request is never generated.
+                    yield converter.failed('Server is busy; the request was not generated.', 'server_error')
                     return
+                for event in converter.admitted():
+                    yield event
                 response = OAIcompletions.stream_chat_completions(converted, stop_event=stop_event)
                 try:
-                    for event in converter.start():
-                        yield event
                     async for chunk in iterate_in_threadpool(response):
                         if stop_event.is_set():
                             return
@@ -300,6 +319,8 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
                 finally:
                     stop_event.set()
                     response.close()
+            finally:
+                Responses.GENERATION_QUEUE.release(ticket)
         return GenerationEventSourceResponse(generator(), stop_event, sep='\n')
 
     monitor = asyncio.create_task(_wait_for_disconnect(request, stop_event))

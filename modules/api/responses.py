@@ -1,4 +1,4 @@
-"""Responses API compatibility over the local Chat Completions generator.
+"""Responses API serializer over native semantic generation events.
 
 History is bounded, process-local CPU memory; it never manages the model KV cache.
 """
@@ -16,7 +16,9 @@ from typing import Literal
 from pydantic import ConfigDict, Field
 
 from .errors import InvalidRequestError
-from .typing import ChatCompletionRequest, GenerationOptions
+from .typing import GenerationRequestOptions, GenerationOptions
+from .canonical_items import ConversationState, render_items as input_messages
+from .generation_events import EventBatch, StartedEvent, TextDelta, ReasoningDelta, ToolCallDelta, DoneEvent, UsageEvent
 from .responses_tools import ToolOutputError, custom_function, custom_input, strict_validator
 
 
@@ -92,6 +94,9 @@ class ResponseStore:
             self._expire()
             if response_id not in self.entries:
                 invalid('Response not found, expired, evicted, or created with store=false.', 'response_id', 404)
+            # Read/chain access marks the entry most-recently-used so an
+            # active conversation survives FIFO-style eviction by idle ones.
+            self.entries.move_to_end(response_id)
             return self.entries[response_id][2]
 
     def get(self, response_id, *, field=None):
@@ -177,14 +182,39 @@ class GenerationQueue:
         self.lock = threading.Lock()
         self.waiters = deque()
 
-    @asynccontextmanager
-    async def slot(self, stop_event):
+    async def acquire(self):
         loop = asyncio.get_running_loop()
         ticket = loop.create_future()
         with self.lock:
             self.waiters.append(ticket)
             if len(self.waiters) == 1:
                 ticket.set_result(True)
+        return ticket
+
+    def wait(self, ticket, stop_event, ping_interval=15.0):
+        """Async generator that waits for a ticket and yields one ping per
+        interval while queued, so a streaming request can announce itself.
+        Waiting uses no inference/threadpool worker. Cancellation checking
+        must not cancel/re-enqueue the ticket, which would break FIFO."""
+        async def _wait():
+            last_ping = time.monotonic()
+            while not ticket.done() and not stop_event.is_set():
+                await asyncio.wait([ticket], timeout=0.1)
+                if not ticket.done() and time.monotonic() - last_ping >= ping_interval:
+                    last_ping = time.monotonic()
+                    yield 'queued'
+        return _wait()
+
+    def release(self, ticket):
+        with self.lock:
+            self.waiters.remove(ticket)
+            if self.waiters and not self.waiters[0].done():
+                next_ticket = self.waiters[0]
+                next_ticket.get_loop().call_soon_threadsafe(self._wake, next_ticket)
+
+    @asynccontextmanager
+    async def slot(self, stop_event):
+        ticket = await self.acquire()
         try:
             # Waiting uses no inference/threadpool worker. Cancellation checking
             # must not cancel/re-enqueue the ticket, which would break FIFO.
@@ -192,11 +222,7 @@ class GenerationQueue:
                 await asyncio.wait([ticket], timeout=0.1)
             yield not stop_event.is_set()
         finally:
-            with self.lock:
-                self.waiters.remove(ticket)
-                if self.waiters and not self.waiters[0].done():
-                    next_ticket = self.waiters[0]
-                    next_ticket.get_loop().call_soon_threadsafe(self._wake, next_ticket)
+            self.release(ticket)
 
     @staticmethod
     def _wake(ticket):
@@ -286,107 +312,6 @@ def output_calls(request, calls):
     if any(not cid for cid in ids) or len(set(ids)) != len(ids):
         raise ToolOutputError('The model generated missing or duplicate tool call IDs.')
     return [output_call(request, call['id'], call['name'], call['arguments']) for call in calls]
-
-
-def _content(value, role, param):
-    if isinstance(value, str):
-        return value
-    if not isinstance(value, list):
-        invalid('content must be a string or an array of content parts.', param)
-    parts = []
-    for part in value:
-        if not isinstance(part, dict):
-            invalid('Invalid content part.', param)
-        kind = part.get('type')
-        if kind in ('input_text', 'output_text'):
-            _fields(part, 'type text annotations logprobs' if kind == 'output_text' else 'type text', param)
-            if kind == 'output_text' and role != 'assistant':
-                invalid('output_text is only valid for assistant messages.', param)
-            parts.append({'type': 'text', 'text': _string(part, 'text', param, True)})
-        elif kind == 'input_image' and role in ('user', 'tool'):
-            _fields(part, 'type image_url file_id detail', param)
-            if part.get('file_id'):
-                invalid('Image file_id is unsupported; provide image_url or a data URL.', param)
-            url = _string(part, 'image_url', param)
-            if not url.startswith(('https://', 'http://', 'data:image/')):
-                invalid('image_url must be an HTTP(S) or image data URL.', param)
-            detail = part.get('detail', 'auto')
-            if detail not in ('auto', 'low', 'high'):
-                invalid('Unsupported image detail.', param)
-            parts.append({'type': 'image_url', 'image_url': {'url': url, 'detail': detail}})
-        else:
-            invalid(f'Unsupported content type: {kind!r}.', param)
-    if all(p['type'] == 'text' for p in parts):
-        return '\n'.join(p['text'] for p in parts)
-    return parts
-
-
-def input_messages(items):
-    if isinstance(items, str):
-        return [{'role': 'user', 'content': items}]
-    messages = []
-    for index, item in enumerate(items):
-        param = f'input.{index}'
-        kind = item.get('type', 'message')
-        if kind == 'message':
-            _fields(item, 'type role content id status phase', param)
-            role = item.get('role')
-            if role not in ('user', 'assistant', 'system', 'developer'):
-                invalid('Unsupported message role.', param)
-            message = {'role': role, 'content': _content(item.get('content'), role, param)}
-            if item.get('phase') is not None:
-                if role != 'assistant' or item['phase'] not in ('commentary', 'final_answer'):
-                    invalid('phase is only supported for assistant commentary/final_answer.', param)
-                message['phase'] = item['phase']
-            messages.append(message)
-        elif kind in ('function_call', 'custom_tool_call'):
-            _fields(item, 'type id call_id name arguments status namespace' if kind == 'function_call'
-                    else 'type id call_id name input namespace', param)
-            name = _string(item, 'name', param)
-            if item.get('namespace') is not None:
-                name = _string(item, 'namespace', param) + '.' + name
-            call = {'id': _string(item, 'call_id', param), 'type': 'function',
-                    'function': {'name': name,
-                                 'arguments': (_string(item, 'arguments', param, True) if kind == 'function_call'
-                                               else json.dumps({'input': _string(item, 'input', param, True)}, ensure_ascii=False))}}
-            if messages and messages[-1]['role'] == 'assistant':
-                messages[-1].setdefault('tool_calls', []).append(call)
-            else:
-                messages.append({'role': 'assistant', 'content': '', 'tool_calls': [call]})
-        elif kind in ('function_call_output', 'custom_tool_call_output'):
-            _fields(item, 'type id call_id output status', param)
-            messages.append({'role': 'tool', 'tool_call_id': _string(item, 'call_id', param),
-                             'content': _content(item.get('output'), 'tool', param)})
-        elif kind == 'reasoning':
-            _fields(item, 'type id summary content encrypted_content status', param)
-            if item.get('encrypted_content'):
-                invalid('Encrypted reasoning cannot be used by a local model.', param)
-            # Local reasoning items carry plaintext content, not a fabricated summary.
-            content = item.get('content') or []
-            if not isinstance(content, list):
-                invalid('Reasoning content must be an array.', param)
-            if item.get('summary') or any(not isinstance(p, dict) or p.get('type') != 'reasoning_text' for p in content):
-                invalid('Only local reasoning_text items can be replayed.', param)
-            thinking = ''.join(_string(p, 'text', param, True) for p in content)
-            messages.append({'role': 'assistant', 'content': '', 'reasoning_content': thinking})
-        else:
-            invalid(f'Unsupported input item type: {kind!r}.', param)
-    # Coalesce adjacent assistant reasoning/text/function items into one model turn.
-    merged = []
-    for message in messages:
-        if (merged and message['role'] == merged[-1]['role'] == 'assistant'
-                and not (message.get('phase') and merged[-1].get('phase') and message['phase'] != merged[-1]['phase'])):
-            prior = merged[-1]
-            prior['content'] += message['content']
-            if message.get('phase'):
-                prior['phase'] = message['phase']
-            if message.get('reasoning_content'):
-                prior['reasoning_content'] = prior.get('reasoning_content', '') + message['reasoning_content']
-            if message.get('tool_calls'):
-                prior.setdefault('tool_calls', []).extend(message['tool_calls'])
-        else:
-            merged.append(message)
-    return merged
 
 
 def prepare(request, store=STORE):
@@ -496,7 +421,17 @@ def prepare(request, store=STORE):
     for key in ('temperature', 'top_p'):
         if body[key] is not None:
             params[key] = body[key]
-    converted = ChatCompletionRequest(**params).model_dump()
+    converted = GenerationRequestOptions(**params).model_dump()
+    # Transitional wire view retained for Chat/legacy callers; the canonical
+    # item graph above is the source of truth for Responses state.
+    converted['messages'] = copy.deepcopy(messages)
+    prefix = messages[:len(messages) - len(input_messages(history))]
+    canonical = ConversationState.from_items([
+        *({'type': 'message', **message} for message in prefix), *history])
+    # IDs are response metadata, never part of the prompt graph for new input.
+    for item in canonical.items:
+        item.data.pop('id', None)
+    converted['items'] = canonical.items
     converted['_responses_no_truncation'] = request.truncation == 'disabled'
     converted['_responses_raise_errors'] = True
     converted['_responses_preserve_items'] = True
@@ -581,8 +516,19 @@ class StreamConverter:
         self.sequence += 1
         return {'event': kind, 'data': json.dumps(event, ensure_ascii=False)}
 
+    def created(self):
+        return [self.event('response.created', response=self.response)]
+
+    def queued(self):
+        # Announced while the request waits for the single local generation
+        # slot, so clients stay informed instead of seeing a silent stream.
+        return [self.event('response.queued', response=self.response)]
+
+    def admitted(self):
+        return [self.event('response.in_progress', response=self.response)]
+
     def start(self):
-        return [self.event('response.created', response=self.response), self.event('response.in_progress', response=self.response)]
+        return self.created() + self.admitted()
 
     def add_text(self, text):
         events = []
@@ -620,7 +566,10 @@ class StreamConverter:
                     events.append(self.event('response.content_part.added', output_index=self.reasoning_index,
                                              item_id=self.reasoning['id'], content_index=0, part=self.reasoning['content'][0]))
                 self.reasoning['content'][0]['text'] += delta['reasoning_content']
-                events.append(self.event('response.reasoning_text.delta', output_index=self.reasoning_index,
+                # Responses API names reasoning stream deltas as summary text
+                # events.  Keep the wire event aligned with the public API so
+                # clients can route reasoning separately from answer text.
+                events.append(self.event('response.reasoning_summary_text.delta', output_index=self.reasoning_index,
                                          item_id=self.reasoning['id'], content_index=0, delta=delta['reasoning_content']))
             if delta.get('content'):
                 if self.buffer_text:
@@ -629,52 +578,107 @@ class StreamConverter:
                     events.extend(self.add_text(delta['content']))
             for call in delta.get('tool_calls', []):
                 index = call.get('index', 0)
-                if index not in self.calls:
-                    self.calls[index] = {'id': '', 'name': '', 'arguments': ''}
+                is_new = index not in self.calls
+                if is_new:
+                    # Emit the item as soon as the provider opens a tool call.
+                    # Waiting until the terminal chunk makes a Responses
+                    # consumer blind during long argument streams.
+                    function = call.get('function', {})
+                    # The item ID is server-generated and must stay stable
+                    # across the stream; the backend ID is only the call_id.
+                    item_id = 'fc_' + uuid.uuid4().hex
+                    self.calls[index] = {'id': call.get('id', ''), 'item_id': item_id,
+                                         'name': function.get('name', ''),
+                                         'arguments': function.get('arguments', ''),
+                                         'output_index': len(self.response['output'])}
+                    item = {'type': 'function_call', 'id': item_id, 'call_id': self.calls[index]['id'],
+                            'name': self.calls[index]['name'], 'arguments': self.calls[index]['arguments'],
+                            'status': 'in_progress'}
+                    self.response['output'].append(item)
+                    events.append(self.event('response.output_item.added',
+                                             output_index=self.calls[index]['output_index'], item=item))
+                    if item['arguments']:
+                        events.append(self.event('response.function_call_arguments.delta',
+                                                 output_index=self.calls[index]['output_index'],
+                                                 item_id=item_id, delta=item['arguments']))
                 assembled = self.calls[index]
                 if call.get('id'):
                     assembled['id'] = call['id']
+                    self.response['output'][assembled['output_index']]['call_id'] = call['id']
                 function = call.get('function', {})
-                assembled['name'] += function.get('name', '')
-                assembled['arguments'] += function.get('arguments', '')
+                name_delta = '' if is_new else function.get('name', '')
+                argument_delta = '' if is_new else function.get('arguments', '')
+                assembled['name'] += name_delta
+                assembled['arguments'] += argument_delta
+                item = self.response['output'][assembled['output_index']]
+                item['name'] = assembled['name']
+                item['arguments'] = assembled['arguments']
+                if argument_delta:
+                    events.append(self.event('response.function_call_arguments.delta',
+                                             output_index=assembled['output_index'],
+                                             item_id=assembled['item_id'], delta=argument_delta))
         return events
 
     def finish(self):
         if self.finish_reason is None:
             raise RuntimeError('Chat stream ended without a finish reason')
-        events = []
+        converted = []
         if self.calls:
             # Calls are assembled first; backend may only identify them at the end.
-            for item in output_calls(self.request, list(self.calls.values())):
-                index = len(self.response['output'])
-                self.response['output'].append(item)
+            raw_calls = list(self.calls.values())
+            converted_items = output_calls(self.request, [
+                {k: call[k] for k in ('id', 'name', 'arguments')}
+                for call in raw_calls
+            ])
+            converted = list(zip(raw_calls, converted_items))
+            for call, item in converted:
+                # Keep compatibility with callers that inject assembled calls
+                # directly (for example adapters and unit tests).
+                index = call.get('output_index', len(self.response['output']))
+                if index == len(self.response['output']):
+                    self.response['output'].append(item)
+                self.response['output'][index] = item
+                if call.get('item_id'):
+                    # Keep the item ID stable across the stream; the backend
+                    # ID only identifies the call (call_id).
+                    item['id'] = call['item_id']
+        # Item lifecycle events must arrive in output order; the terminal
+        # chunks can finalize items in any order.
+        groups = {}
+        if self.calls:
+            for call, item in converted:
+                index = call.get('output_index', len(self.response['output']) - 1)
                 if item['type'] == 'custom_tool_call':
-                    events.append(self.event('response.output_item.added', output_index=index, item={**item, 'input': ''}))
-                    events.append(self.event('response.custom_tool_call_input.delta', output_index=index, item_id=item['id'], delta=item['input']))
-                    events.append(self.event('response.custom_tool_call_input.done', output_index=index, item_id=item['id'], input=item['input']))
+                    group = [
+                        self.event('response.custom_tool_call_input.delta', output_index=index, item_id=item['id'], delta=item['input']),
+                        self.event('response.custom_tool_call_input.done', output_index=index, item_id=item['id'], input=item['input'])]
                 else:
-                    events.append(self.event('response.output_item.added', output_index=index,
-                                             item={**item, 'arguments': '', 'status': 'in_progress'}))
-                    events.append(self.event('response.function_call_arguments.delta', output_index=index, item_id=item['id'], delta=item['arguments']))
-                    events.append(self.event('response.function_call_arguments.done', output_index=index, item_id=item['id'], arguments=item['arguments'], name=item['name']))
-                events.append(self.event('response.output_item.done', output_index=index, item=item))
+                    group = [self.event('response.function_call_arguments.done', output_index=index, item_id=item['id'],
+                                        arguments=item['arguments'], name=item['name'])]
+                group.append(self.event('response.output_item.done', output_index=index, item=item))
+                groups.setdefault(index, []).extend(group)
         elif self.pending_text or not self.response['output']:
-            events.extend(self.add_text(self.pending_text))
+            # Buffered text creates its item now; its open events join the
+            # item's group so the stream stays in output order.
+            groups[self.message_index] = self.add_text(self.pending_text)
         if self.reasoning is not None:
             part = self.reasoning['content'][0]
-            events.append(self.event('response.reasoning_text.done', output_index=self.reasoning_index,
-                                     item_id=self.reasoning['id'], content_index=0, text=part['text']))
-            events.append(self.event('response.content_part.done', output_index=self.reasoning_index,
-                                     item_id=self.reasoning['id'], content_index=0, part=part))
-            events.append(self.event('response.output_item.done', output_index=self.reasoning_index, item=self.reasoning))
+            groups.setdefault(self.reasoning_index, []).extend([
+                self.event('response.reasoning_summary_text.done', output_index=self.reasoning_index,
+                           item_id=self.reasoning['id'], content_index=0, text=part['text']),
+                self.event('response.content_part.done', output_index=self.reasoning_index,
+                           item_id=self.reasoning['id'], content_index=0, part=part),
+                self.event('response.output_item.done', output_index=self.reasoning_index, item=self.reasoning)])
         if self.message is not None:
             part = self.message['content'][0]
             self.message['status'] = 'incomplete' if self.finish_reason == 'length' else 'completed'
-            events.append(self.event('response.output_text.done', output_index=self.message_index,
-                                     item_id=self.message['id'], content_index=0, text=part['text'], logprobs=[]))
-            events.append(self.event('response.content_part.done', output_index=self.message_index,
-                                     item_id=self.message['id'], content_index=0, part=part))
-            events.append(self.event('response.output_item.done', output_index=self.message_index, item=self.message))
+            groups.setdefault(self.message_index, []).extend([
+                self.event('response.output_text.done', output_index=self.message_index,
+                           item_id=self.message['id'], content_index=0, text=part['text'], logprobs=[]),
+                self.event('response.content_part.done', output_index=self.message_index,
+                           item_id=self.message['id'], content_index=0, part=part),
+                self.event('response.output_item.done', output_index=self.message_index, item=self.message)])
+        events = [event for index in sorted(groups) for event in groups[index]]
         complete_response(self.response, self.finish_reason, self.token_usage)
         save_response(self.request, self.response, self.history, self.store)
         events.append(self.event('response.' + self.response['status'], response=self.response))

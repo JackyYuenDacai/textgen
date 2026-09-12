@@ -95,6 +95,16 @@ class ResponsesTests(unittest.TestCase):
         self.assertTrue(store.delete('c')['deleted'])
         with self.assertRaises(InvalidRequestError): store.get('c')
 
+    def test_read_access_protects_active_entry_from_eviction(self):
+        store = api.ResponseStore(max_entries=2)
+        store.put({'id': 'a'}, [])
+        store.put({'id': 'b'}, [])
+        store.get('a')  # Chaining/retrieving 'a' marks it most-recently-used.
+        store.put({'id': 'c'}, [])
+        with self.assertRaises(InvalidRequestError): store.get('b')
+        self.assertEqual(store.get('a', field='response')['id'], 'a')
+        self.assertEqual(store.get('c', field='response')['id'], 'c')
+
     def test_response_lookup_does_not_copy_history_and_snapshot_is_isolated(self):
         self.store.put({'id': 'r', 'output': []}, [{'content': 'large history'}])
         original_copy = copy.deepcopy
@@ -426,6 +436,30 @@ class ResponsesTests(unittest.TestCase):
         self.assertEqual(data[-1]['response']['output'][0]['arguments'], '{}')
         self.assertEqual(data[-1]['response']['output'][0]['call_id'], 'call_1')
 
+    def test_stream_tool_item_id_stable_and_done_events_in_output_order(self):
+        req = api.ResponsesRequest(input='Hi', tools=[{'type': 'function', 'name': 'f', 'strict': False}], store=False)
+        stream = api.StreamConverter(req, [], 'model', self.store)
+        events = stream.start()
+        events += stream.process({'choices': [{'delta': {'reasoning_content': 'think'}}]})
+        events += stream.process({'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'call_1', 'function': {'name': 'f', 'arguments': '{'}}]}}]})
+        events += stream.process({'choices': [{'delta': {'tool_calls': [{'index': 0, 'function': {'arguments': '}'}}]}, 'finish_reason': 'tool_calls'}]})
+        events += stream.finish()
+        data = decoded(events)
+        added = next(e for e in data if e['type'] == 'response.output_item.added' and e['item']['type'] == 'function_call')
+        item_id = added['item']['id']
+        self.assertTrue(item_id.startswith('fc_'))
+        self.assertEqual(added['item']['call_id'], 'call_1')
+        # Every streamed event for the call references the same stable item ID.
+        for e in data:
+            if e['type'] in ('response.function_call_arguments.delta', 'response.function_call_arguments.done'):
+                self.assertEqual(e['item_id'], item_id)
+        done = next(e for e in data if e['type'] == 'response.output_item.done' and e['output_index'] == 1)
+        self.assertEqual(done['item']['id'], item_id)
+        self.assertEqual(done['item']['call_id'], 'call_1')
+        # Item lifecycle events arrive in output order: reasoning (0) before the call (1).
+        done_indexes = [e['output_index'] for e in data if e['type'] == 'response.output_item.done']
+        self.assertEqual(done_indexes, sorted(done_indexes))
+
     def test_tool_batch_validation_never_exposes_partial_executable_output(self):
         tool = {'type': 'function', 'name': 'f', 'strict': True,
                 'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}
@@ -545,6 +579,77 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(events[-1]['response']['error']['code'], 'invalid_prompt')
             self.assertNotIn('response.completed', [e['type'] for e in events])
             put.assert_not_called()
+
+    async def test_tool_result_followup_chain_over_http(self):
+        import httpx
+        tools = [{'type': 'function', 'name': 'add', 'description': 'add',
+                  'parameters': {'type': 'object', 'properties': {'a': {'type': 'integer'}}, 'required': ['a']}}]
+        bodies = []
+        def backend(*args, **kwargs):
+            bodies.append(args[0])
+            if len(bodies) == 1:
+                tc = {'index': 0, 'id': 'call_1', 'function': {'name': 'add', 'arguments': '{"a": 1}'}}
+                yield {'choices': [{'delta': {'tool_calls': [tc]}, 'finish_reason': 'tool_calls'}]}
+                yield {'choices': [], 'usage': {'prompt_tokens': 5, 'completion_tokens': 2, 'total_tokens': 7}}
+            else:
+                yield {'choices': [{'delta': {'content': 'The sum is 2.'}}]}
+                yield {'choices': [{'delta': {}, 'finish_reason': 'stop'}]}
+                yield {'choices': [], 'usage': {'prompt_tokens': 9, 'completion_tokens': 5, 'total_tokens': 14}}
+        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
+                patch.object(script.shared.args, 'api_key', ''), \
+                patch('sse_starlette.sse.AppStatus.should_exit_event', None):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=script.app), base_url='http://127.0.0.1') as client:
+                first = await client.post('/v1/responses', json={'input': 'Use the tool', 'tools': tools, 'stream': True})
+                events = [json.loads(line[6:]) for line in first.text.splitlines() if line.startswith('data: ')]
+                response = events[-1]['response']
+                # Codex follows up by referencing the stored response and
+                # appending only the tool result item.
+                followup = await client.post('/v1/responses', json={
+                    'previous_response_id': response['id'],
+                    'input': [{'type': 'function_call_output', 'call_id': 'call_1', 'output': '2'}],
+                    'tools': tools, 'stream': True})
+                followup_events = [json.loads(line[6:]) for line in followup.text.splitlines() if line.startswith('data: ')]
+        self.assertEqual(events[-1]['type'], 'response.completed')
+        self.assertEqual(response['output'][0]['type'], 'function_call')
+        self.assertEqual(response['output'][0]['call_id'], 'call_1')
+        self.assertEqual(followup_events[-1]['type'], 'response.completed')
+        self.assertEqual(followup_events[-1]['response']['output'][0]['content'][0]['text'], 'The sum is 2.')
+        # The stored history replayed the tool call and the new tool result.
+        self.assertEqual(bodies[1]['messages'][-2]['role'], 'assistant')
+        self.assertEqual(bodies[1]['messages'][-2]['tool_calls'][0]['id'], 'call_1')
+        self.assertEqual(bodies[1]['messages'][-1]['role'], 'tool')
+        self.assertEqual(bodies[1]['messages'][-1]['tool_call_id'], 'call_1')
+        self.assertEqual(bodies[1]['messages'][-1]['content'], '2')
+
+    async def test_queued_wait_pings_until_admission_and_releases_fifo(self):
+        queue = api.GenerationQueue()
+        stop = threading.Event()
+        first = await queue.acquire()
+        second = await queue.acquire()
+        pings = []
+        async def wait_second():
+            async for ping in queue.wait(second, stop, 0.05):
+                pings.append(ping)
+        waiter = asyncio.create_task(wait_second())
+        await asyncio.sleep(0.25)
+        self.assertGreaterEqual(len(pings), 2)
+        queue.release(first)
+        await asyncio.wait_for(waiter, 2)
+        queue.release(second)
+        self.assertTrue(all(ping == 'queued' for ping in pings))
+        self.assertEqual(len(queue.waiters), 0)
+        # A request that stops while queued is denied without breaking FIFO.
+        denied = threading.Event()
+        third = await queue.acquire()
+        async def wait_third():
+            async for _ in queue.wait(third, denied, 0.05):
+                pass
+        third_waiter = asyncio.create_task(wait_third())
+        await asyncio.sleep(0.1)
+        denied.set()
+        await asyncio.wait_for(third_waiter, 2)
+        queue.release(third)
+        self.assertEqual(len(queue.waiters), 0)
 
     async def test_stream_disconnect_cancels_prefill_without_persisting(self):
         entered, finished = threading.Event(), threading.Event()
