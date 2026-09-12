@@ -21,6 +21,7 @@ from modules.chat import (
     load_character_memoized,
     load_instruction_template_memoized
 )
+
 from modules.image_utils import convert_openai_messages_to_images
 from modules.logging_colors import logger
 from modules.presets import load_preset_memoized

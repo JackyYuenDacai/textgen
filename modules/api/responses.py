@@ -350,12 +350,8 @@ def prepare(request, store=STORE):
     names = set()
     for index, tool in enumerate(function_definitions(request.tools)):
         param = f'tools.{index}'
-        # Codex may advertise its hosted web search tool even when the local
-        # backend cannot execute server-side tools. Ignore it here; local
-        # function tools remain available and the request can proceed without
-        # requiring clients to remember web_search=disabled.
         if tool.get('type') in ('web_search', 'web_search_preview', 'file_search', 'computer_use_preview'):
-            continue
+            invalid('Hosted tools are not supported by the local Responses backend.', param)
         if tool.get('type') == 'custom':
             _fields(tool, 'type name description format', param)
             _string(tool, 'name', param)
@@ -516,7 +512,11 @@ class StreamConverter:
         # buffering all text whenever tools are present makes the final answer
         # appear only at completion. Keep text streaming; the legacy adapter
         # still has its own tool-call filtering in process().
-        self.buffer_text = False
+        # Legacy chat-chunk providers may emit tool markup as ordinary text
+        # before the structured tool call arrives. Buffer that text so it is
+        # never exposed as answer content. Native EventBatch generation does
+        # not use this branch and remains fully streaming.
+        self.buffer_text = bool(request.tools) and request.tool_choice != 'none'
         self.pending_text = ''
 
     def event(self, kind, **data):

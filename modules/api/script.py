@@ -298,8 +298,9 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
                     return
                 for event in converter.admitted():
                     yield event
-                # Keep injected legacy backends working for integrations that
-                # replace the Chat adapter; normal requests use native events.
+                # Production uses native semantic events. The mock hook keeps
+                # legacy integrations and the test harness injectable without
+                # affecting normal requests.
                 if hasattr(OAIcompletions.stream_chat_completions, 'mock_calls'):
                     response = OAIcompletions.stream_chat_completions(converted, stop_event=stop_event)
                 else:
