@@ -3,12 +3,21 @@
 Tool recognition remains in the model parser. A tool-capable parser may need
 the complete call before it can distinguish markup from ordinary text.
 """
+from enum import Enum, auto
 from .generation_events import (EventBatch, StartedEvent, TextDelta, ReasoningDelta,
                                 ToolCallDelta, DoneEvent, UsageEvent)
 from .canonical_items import render_items
 from .generation_support import *
 from .generation_support import (_get_raw_logprob_entries, _dict_to_logprob_entries,
-                                 _compute_prompt_logprob_entries)
+                                _compute_prompt_logprob_entries)
+
+
+class GenerationState(Enum):
+    GENERATING_REASONING = auto()
+    GENERATING_TEXT = auto()
+    GENERATING_TOOL_CALL = auto()
+    WAITING_FOR_TOOL_RESULT = auto()
+    COMPLETED = auto()
 
 def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False, stop_event=None) -> dict:
     if body.get('functions', []):
@@ -159,6 +168,7 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
         user_input, generate_params, regenerate=False, _continue=continue_, loading_message=False)
 
     answer = ''
+    state = GenerationState.GENERATING_TEXT
     seen_content = ''
     seen_reasoning = ''
 
@@ -190,6 +200,7 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
                             tc["index"] = len(tool_calls)
                         tc["function"]["arguments"] = json.dumps(tc["function"]["arguments"])
                         tool_calls.append(tc)
+                    state = GenerationState.GENERATING_TOOL_CALL
                     end_last_tool_call = len(answer)
 
             # Stop generation before streaming content if tool_calls were detected,
@@ -202,9 +213,11 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
                 # Reasoning is emitted separately as reasoning_content deltas.
                 reasoning, content = extract_reasoning(answer)
                 if reasoning is not None:
+                    state = GenerationState.GENERATING_REASONING
                     new_reasoning = reasoning[len(seen_reasoning):]
                     new_content = content[len(seen_content):]
                 else:
+                    state = GenerationState.GENERATING_TEXT
                     new_reasoning = None
                     new_content = answer[len(seen_content):]
 
@@ -238,12 +251,14 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
         completion_token_count = len(encode(answer)[0])
     if len(tool_calls) > 0:
         stop_reason = "tool_calls"
+        state = GenerationState.WAITING_FOR_TOOL_RESULT
     elif response_metrics.get('finish_reason'):
         stop_reason = response_metrics['finish_reason']
     elif token_count + completion_token_count >= generate_params['truncation_length'] or completion_token_count >= generate_params['max_new_tokens']:
         stop_reason = "length"
     else:
         stop_reason = "stop"
+        state = GenerationState.COMPLETED
 
     token_usage = {
         'prompt_tokens': token_count,

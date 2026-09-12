@@ -46,5 +46,12 @@ def stable_tool_definitions(tools):
 
     # JSON object key order is not semantic. Preserve all array order within a
     # schema (e.g. examples, enum, prefixItems), and never mutate caller data.
-    serialized = [json.dumps(tool, sort_keys=True, ensure_ascii=False) for tool in tools]
+    # _meta is application inventory data (source/category) and is not part of
+    # the OpenAI tool schema. Keep it out of prompts and API payloads.
+    sanitized = []
+    for tool in tools:
+        value = dict(tool)
+        value.pop('_meta', None)
+        sanitized.append(value)
+    serialized = [json.dumps(tool, sort_keys=True, ensure_ascii=False) for tool in sanitized]
     return [json.loads(tool) for tool in sorted(serialized)]

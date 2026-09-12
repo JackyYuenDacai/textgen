@@ -10,7 +10,10 @@ THINKING_FORMATS = [
     ('<|channel>thought', '<channel|>', None),  # Gemma 4
     ('thought\n', '<channel|>', None),  # Gemma 4 (after tool responses, <|channel> may be absent)
     ('<|think|>', '<|end|>', '<|content|>'),  # Solar Open
-    # ('Thinking Process:', '</think>', None),  # Qwen3.5 verbose thinking outside tags -- removed: too prone to false positives in streaming
+    # Verbose plain-text reasoning used by some instruction templates.  The
+    # explicit final marker makes this safe enough to use in streaming.
+    ('Thinking Process:', 'Final Answer:', None),
+    ('Thinking:', 'Final:', None),
     (None, '</think>', None),  # End-only variant (e.g., Qwen3-next)
 ]
 

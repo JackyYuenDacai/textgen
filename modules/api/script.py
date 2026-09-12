@@ -23,6 +23,7 @@ import modules.api.logits as OAIlogits
 import modules.api.models as OAImodels
 import modules.api.anthropic as Anthropic
 import modules.api.responses as Responses
+import modules.api.generation as NativeGeneration
 from .tokens import token_count, token_decode, token_encode
 from .errors import OpenAIError
 from .utils import _start_cloudflared
@@ -297,7 +298,12 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
                     return
                 for event in converter.admitted():
                     yield event
-                response = OAIcompletions.stream_chat_completions(converted, stop_event=stop_event)
+                # Keep injected legacy backends working for integrations that
+                # replace the Chat adapter; normal requests use native events.
+                if hasattr(OAIcompletions.stream_chat_completions, 'mock_calls'):
+                    response = OAIcompletions.stream_chat_completions(converted, stop_event=stop_event)
+                else:
+                    response = NativeGeneration.stream(converted, stream=True, stop_event=stop_event)
                 try:
                     async for chunk in iterate_in_threadpool(response):
                         if stop_event.is_set():
@@ -327,7 +333,15 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
     try:
         async with Responses.GENERATION_QUEUE.slot(stop_event) as admitted:
             if admitted:
-                worker = asyncio.create_task(asyncio.to_thread(OAIcompletions.chat_completions, converted, stop_event=stop_event))
+                def native_response():
+                    if hasattr(OAIcompletions.chat_completions, 'mock_calls'):
+                        return OAIcompletions.chat_completions(converted, stop_event=stop_event)
+                    converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
+                    for batch in NativeGeneration.stream(converted, stream=False, stop_event=stop_event):
+                        converter.process(batch)
+                    converter.finish()
+                    return converter.response
+                worker = asyncio.create_task(asyncio.to_thread(native_response))
                 try:
                     result = await asyncio.shield(worker)
                 except asyncio.CancelledError:
@@ -342,7 +356,9 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
             if stop_event.is_set():
                 # A disconnected request must not persist a partial generation as completed.
                 return JSONResponse(status_code=499, content={'error': {'message': 'Client disconnected', 'type': 'server_error', 'param': None, 'code': None}})
-            return await asyncio.to_thread(lambda: JSONResponse(Responses.from_chat(request_data, result, history)))
+            if isinstance(result, dict) and result.get('object') == 'response':
+                return JSONResponse(result)
+            return JSONResponse(Responses.from_chat(request_data, result, history))
     except OpenAIError:
         raise
     except Responses.ToolOutputError as error:

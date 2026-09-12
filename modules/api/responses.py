@@ -350,6 +350,12 @@ def prepare(request, store=STORE):
     names = set()
     for index, tool in enumerate(function_definitions(request.tools)):
         param = f'tools.{index}'
+        # Codex may advertise its hosted web search tool even when the local
+        # backend cannot execute server-side tools. Ignore it here; local
+        # function tools remain available and the request can proceed without
+        # requiring clients to remember web_search=disabled.
+        if tool.get('type') in ('web_search', 'web_search_preview', 'file_search', 'computer_use_preview'):
+            continue
         if tool.get('type') == 'custom':
             _fields(tool, 'type name description format', param)
             _string(tool, 'name', param)
@@ -506,7 +512,11 @@ class StreamConverter:
         self.calls = OrderedDict()
         self.finish_reason = None
         self.token_usage = None
-        self.buffer_text = bool(request.tools) and request.tool_choice != 'none'
+        # NativeGeneration emits tool calls as separate semantic events, so
+        # buffering all text whenever tools are present makes the final answer
+        # appear only at completion. Keep text streaming; the legacy adapter
+        # still has its own tool-call filtering in process().
+        self.buffer_text = False
         self.pending_text = ''
 
     def event(self, kind, **data):
@@ -547,6 +557,11 @@ class StreamConverter:
         return events
 
     def process(self, chunk):
+        # Native generation path: adapt semantic events directly at the
+        # Responses boundary. The legacy Chat-chunk branch below remains for
+        # third-party backends and backwards compatibility.
+        if isinstance(chunk, EventBatch):
+            return self.process_events(chunk)
         events = []
         if chunk.get('model'):
             self.response['model'] = chunk['model']
@@ -617,6 +632,51 @@ class StreamConverter:
                     events.append(self.event('response.function_call_arguments.delta',
                                              output_index=assembled['output_index'],
                                              item_id=assembled['item_id'], delta=argument_delta))
+        return events
+
+    def process_events(self, batch):
+        events = []
+        for event in batch.events:
+            if isinstance(event, StartedEvent):
+                self.response['model'] = event.model
+            elif isinstance(event, TextDelta):
+                events.extend(self.add_text(event.text))
+            elif isinstance(event, ReasoningDelta):
+                events.extend(self._add_reasoning(event.text))
+            elif isinstance(event, ToolCallDelta):
+                index = event.index
+                if index not in self.calls:
+                    self.calls[index] = {'id': event.call_id, 'item_id': 'fc_' + uuid.uuid4().hex,
+                                         'name': event.name, 'arguments': '',
+                                         'output_index': len(self.response['output'])}
+                    item = {'type': 'function_call', 'id': self.calls[index]['item_id'],
+                            'call_id': event.call_id, 'name': event.name, 'arguments': '', 'status': 'in_progress'}
+                    self.response['output'].append(item)
+                    events.append(self.event('response.output_item.added', output_index=self.calls[index]['output_index'], item=item))
+                call = self.calls[index]
+                call['arguments'] += event.arguments_delta
+                item = self.response['output'][call['output_index']]
+                item['arguments'] = call['arguments']
+                if event.arguments_delta:
+                    events.append(self.event('response.function_call_arguments.delta', output_index=call['output_index'], item_id=call['item_id'], delta=event.arguments_delta))
+            elif isinstance(event, DoneEvent):
+                self.finish_reason = event.finish_reason
+            elif isinstance(event, UsageEvent):
+                self.token_usage = event.usage
+        return events
+
+    def _add_reasoning(self, text):
+        if self.reasoning is None:
+            self.reasoning = {'type': 'reasoning', 'id': 'rs_' + uuid.uuid4().hex, 'summary': [],
+                              'content': [{'type': 'reasoning_text', 'text': ''}]}
+            self.reasoning_index = len(self.response['output'])
+            self.response['output'].append(self.reasoning)
+            events = [self.event('response.output_item.added', output_index=self.reasoning_index, item={**self.reasoning, 'content': []}),
+                      self.event('response.content_part.added', output_index=self.reasoning_index, item_id=self.reasoning['id'], content_index=0, part=self.reasoning['content'][0])]
+        else:
+            events = []
+        self.reasoning['content'][0]['text'] += text
+        events.append(self.event('response.reasoning_summary_text.delta', output_index=self.reasoning_index, item_id=self.reasoning['id'], content_index=0, delta=text))
         return events
 
     def finish(self):

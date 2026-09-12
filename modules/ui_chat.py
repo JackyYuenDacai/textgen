@@ -102,10 +102,10 @@ def create_ui():
 
                 shared.gradio['jinja_controls_separator'] = gr.HTML("<div class='sidebar-vertical-separator'></div>", visible=show_separator and not_chat)
 
-                from modules.tool_use import get_available_tools
-                shared.gradio['selected_tools'] = gr.CheckboxGroup(choices=get_available_tools(), value=shared.settings.get('selected_tools', []), label='Tools', info='Functions the model can call during generation.', elem_id='tools-group', visible=not_chat)
+                from modules.tool_use import get_available_tools, get_tool_choices
+                shared.gradio['selected_tools'] = gr.CheckboxGroup(choices=get_tool_choices(), value=shared.settings.get('selected_tools', []), label='Tools', info='Tools are grouped by category; values remain stable for saved settings.', elem_id='tools-group', visible=not_chat)
                 shared.gradio['tools_refresh'] = gr.Button('Refresh list', elem_id='tools-refresh-btn', visible=False)
-                shared.gradio['tools_refresh'].click(fn=lambda: gr.update(choices=get_available_tools()), inputs=[], outputs=[shared.gradio['selected_tools']])
+                shared.gradio['tools_refresh'].click(fn=lambda: gr.update(choices=get_tool_choices()), inputs=[], outputs=[shared.gradio['selected_tools']])
 
                 def sync_web_tools(selected):
                     if 'web_search' in selected and 'fetch_webpage' not in selected and 'fetch_webpage' in get_available_tools():

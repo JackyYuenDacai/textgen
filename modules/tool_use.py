@@ -16,6 +16,17 @@ def get_available_tools():
     return sorted((p.stem for p in tools_dir.glob('*.py')), key=natural_keys)
 
 
+def get_tool_choices():
+    """Return grouped labels while preserving script names as checkbox values."""
+    groups = {'web': [], 'documents': [], 'desktop': [], 'messaging': [], 'image': [], 'other': []}
+    for name in get_available_tools():
+        groups[_infer_tool_category(name)].append(name)
+    choices = []
+    for category in ('web', 'documents', 'desktop', 'messaging', 'image', 'other'):
+        choices.extend((f'[{category}] {name}', name) for name in groups[category])
+    return choices
+
+
 def load_tools(selected_names):
     """
     Import selected tool scripts and return their definitions and executors.
@@ -115,6 +126,7 @@ def _load_mcp_json():
 
         servers.append({
             "type": "stdio",
+            "name": name,
             "command": command,
             "args": entry.get("args", []),
             "env": entry.get("env"),
@@ -123,9 +135,19 @@ def _load_mcp_json():
     return servers
 
 
-def _mcp_tool_to_openai(tool):
+def _infer_tool_category(name, server=None):
+    n, s = (name or '').lower(), (server or '').lower()
+    if 'document' in s or n.startswith(('document_', 'pdf_', 'word_')): return 'documents'
+    if 'computer' in s or n.startswith(('desktop_', 'screen_')): return 'desktop'
+    if n.startswith(('qq_', 'mail_', 'slack_')): return 'messaging'
+    if n.startswith(('image_', 'vision_')): return 'image'
+    if n.startswith(('web_', 'search_', 'fetch_')): return 'web'
+    return 'other'
+
+
+def _mcp_tool_to_openai(tool, server_name=None):
     """Convert an MCP Tool object to OpenAI-format tool dict."""
-    return {
+    definition = {
         "type": "function",
         "function": {
             "name": tool.name,
@@ -133,6 +155,9 @@ def _mcp_tool_to_openai(tool):
             "parameters": tool.inputSchema or {"type": "object", "properties": {}}
         }
     }
+    definition['_meta'] = {'source': 'mcp', 'server': server_name,
+                           'category': _infer_tool_category(tool.name, server_name)}
+    return definition
 
 
 def _mcp_server_id(server):
@@ -181,7 +206,7 @@ async def _connect_mcp_server(server):
         tool_defs = []
         executors = {}
         for tool in result.tools:
-            tool_defs.append(_mcp_tool_to_openai(tool))
+            tool_defs.append(_mcp_tool_to_openai(tool, server.get('name') or _mcp_server_id(server)))
             executors[tool.name] = _make_mcp_executor(tool.name, server)
         return tool_defs, executors
 

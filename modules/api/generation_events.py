@@ -85,3 +85,16 @@ class ChatSerializer:
         if not self.stream or self.include_usage:
             result['usage'] = usage
         return [result]
+
+
+# Public names used by adapters and extension authors.  The compact event
+# classes above carry the same semantics while these aliases keep the API
+# readable and compatible with the Responses design document.
+TextStart = StartedEvent
+TextDone = DoneEvent
+ReasoningStart = StartedEvent
+ReasoningDone = DoneEvent
+ToolCallStart = ToolCallDelta
+ToolCallArgumentsDelta = ToolCallDelta
+ToolCallDone = ToolCallDelta
+GenerationCompleted = DoneEvent
