@@ -274,6 +274,8 @@ RESPONSES_QUEUE_PING_SECONDS = 15.0
 
 @app.post('/v1/responses', dependencies=check_key)
 async def openai_responses(request: Request, request_data: Responses.ResponsesRequest):
+    logger.info('Responses request stream=%s tools=%d model=%s', request_data.stream,
+                len(request_data.tools or []), request_data.model)
     # Validate and resolve history before returning HTTP 200 / starting SSE.
     converted, history = await asyncio.to_thread(Responses.prepare, request_data)
     stop_event = threading.Event()
