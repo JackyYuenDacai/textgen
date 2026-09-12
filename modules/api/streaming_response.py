@@ -6,12 +6,6 @@ from sse_starlette import EventSourceResponse
 class GenerationEventSourceResponse(EventSourceResponse):
     def __init__(self, content, stop_event, **kwargs):
         self.stop_event = stop_event
-        # Proxy-safe SSE headers. Do not set hop-by-hop ``Connection`` or
-        # ``no-transform``: both can make HTTP/2/Codex clients buffer events.
-        headers = dict(kwargs.pop('headers', {}) or {})
-        headers.setdefault('Cache-Control', 'no-cache')
-        headers.setdefault('X-Accel-Buffering', 'no')
-        kwargs['headers'] = headers
         super().__init__(content, **kwargs)
 
     async def __call__(self, scope, receive, send):
