@@ -34,3 +34,4 @@ wandb
 .env
 /downloads
 /backups
+/exllamav3
