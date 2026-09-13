@@ -612,6 +612,10 @@ class Exllamav3Model:
         stop_conditions = [] if state['ban_eos_token'] else list(eos_ids)
 
         filters = []
+        if state.get('_responses_output_grammar') is not None:
+            from exllamav3.generator.filter.llguidance import LLGuidanceFilter
+            filters.append(LLGuidanceFilter(
+                self.tokenizer, llg_grammar=state['_responses_output_grammar'], eos_after_completed=True))
         logit_bias = state.get('logit_bias')
         if logit_bias:
             filters.append(LogitBiasFilter(self.tokenizer, logit_bias))

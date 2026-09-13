@@ -4,12 +4,15 @@ Tool recognition remains in the model parser. A tool-capable parser may need
 the complete call before it can distinguish markup from ordinary text.
 """
 from enum import Enum, auto
+import os
 from .generation_events import (EventBatch, StartedEvent, TextDelta, ReasoningDelta,
                                 ToolCallDelta, DoneEvent, UsageEvent)
 from .canonical_items import render_items
 from .generation_support import *
 from .generation_support import (_get_raw_logprob_entries, _dict_to_logprob_entries,
                                 _compute_prompt_logprob_entries)
+import time
+from modules.logging_colors import logger
 
 
 class GenerationState(Enum):
@@ -65,6 +68,11 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
 
     # generation parameters
     generate_params = process_parameters(body, is_legacy=is_legacy)
+    if generate_params.get('_responses_output_grammar') is not None:
+        # Presets may override request settings; structured output starts at
+        # the first sampled token, so it must not begin inside a thinking block.
+        generate_params['enable_thinking'] = False
+        generate_params['ban_eos_token'] = False
     if stop_event is not None:
         generate_params['stop_event'] = stop_event
     continue_ = body['continue_']
@@ -168,6 +176,15 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
         user_input, generate_params, regenerate=False, _continue=continue_, loading_message=False)
 
     answer = ''
+    generation_started_at = time.perf_counter()
+    first_backend_chunk_at = None
+    first_reasoning_at = None
+    first_text_at = None
+    first_tool_call_at = None
+    # Full output is captured once per request by the Responses route. Keep
+    # token-level generation logging opt-in for low-noise production logs.
+    debug_output = os.environ.get('TEXTGEN_RESPONSES_LOG_OUTPUT', '0').lower() not in ('0', 'false', 'off')
+    debug_output_chars = 0
     state = GenerationState.GENERATING_TEXT
     seen_content = ''
     seen_reasoning = ''
@@ -189,13 +206,24 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
 
     try:
         for a in generator:
+            if first_backend_chunk_at is None:
+                first_backend_chunk_at = time.perf_counter()
+                logger.info('Responses first backend chunk after %.2fs', first_backend_chunk_at - generation_started_at)
             answer = a['internal'][-1][1]
 
             if supported_tools is not None:
                 tool_call = parse_tool_call(answer[end_last_tool_call:], supported_tools, parsers=_tool_parsers) if len(answer) > 0 else []
                 if len(tool_call) > 0:
+                    if first_tool_call_at is None:
+                        first_tool_call_at = time.perf_counter()
+                        logger.info('Responses first tool-call delta after %.2fs',
+                                    first_tool_call_at - generation_started_at)
                     for tc in tool_call:
                         tc["id"] = get_tool_call_id()
+                        if generate_params.get('_responses_raise_errors'):
+                            logger.info('Responses recognized tool call name=%s', tc.get('function', {}).get('name', ''))
+                            if debug_output:
+                                logger.info('Responses generated tool arguments: %r', str(tc.get('function', {}).get('arguments', ''))[:2000])
                         if stream:
                             tc["index"] = len(tool_calls)
                         tc["function"]["arguments"] = json.dumps(tc["function"]["arguments"])
@@ -207,6 +235,12 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
             # so that raw tool markup is not sent as content deltas.
             if len(tool_calls) > 0:
                 break
+
+            # Tool markup is cumulative and cannot be parsed until the closing
+            # tag arrives. Never leak its prefix as answer text: clients such
+            # as Codex render that XML literally instead of executing it.
+            if supported_tools is not None and '<tool_call>' in answer:
+                continue
 
             if stream:
                 # Strip reasoning/thinking blocks so only final content is streamed.
@@ -220,6 +254,19 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
                     state = GenerationState.GENERATING_TEXT
                     new_reasoning = None
                     new_content = answer[len(seen_content):]
+
+                if new_reasoning and first_reasoning_at is None:
+                    first_reasoning_at = time.perf_counter()
+                    logger.info('Responses first reasoning delta after %.2fs', first_reasoning_at - generation_started_at)
+                if new_content and first_text_at is None:
+                    first_text_at = time.perf_counter()
+                    logger.info('Responses first text delta after %.2fs', first_text_at - generation_started_at)
+                if debug_output and (new_reasoning or new_content) and debug_output_chars < 2000:
+                    piece = new_reasoning or new_content
+                    remaining = 2000 - debug_output_chars
+                    logger.info('Responses generated %s: %r',
+                                'reasoning' if new_reasoning else 'text', piece[:remaining])
+                    debug_output_chars += min(len(piece), remaining)
 
                 if (not new_content and not new_reasoning) or chr(0xfffd) in (new_content or '') + (new_reasoning or ''):
                     continue
@@ -268,6 +315,19 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
     if 'cached_tokens' in response_metrics:
         token_usage['prompt_tokens_details'] = {'cached_tokens': response_metrics['cached_tokens']}
 
+    # Keep a generation-level completion marker alongside the HTTP/SSE
+    # adapter's response.completed log.  This is emitted after the backend
+    # iterator has fully stopped, so it distinguishes model completion from
+    # the time spent serializing and delivering terminal Responses events.
+    if '_responses_metrics' in generate_params:
+        logger.info('Responses generation completed after %.2fs finish_reason=%s '
+                    'backend_chunk=%s reasoning_delta=%s text_delta=%s tool_call_delta=%s',
+                    time.perf_counter() - generation_started_at, stop_reason,
+                    first_backend_chunk_at is not None,
+                    first_reasoning_at is not None,
+                    first_text_at is not None,
+                    first_tool_call_at is not None)
+
     if stream:
         batch = semantic_batch(chunk_tool_calls=tool_calls)
         batch.events.append(DoneEvent(stop_reason))
@@ -289,7 +349,6 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
                 batch.logprobs = format_chat_logprobs(raw)
         batch.events.extend([DoneEvent(stop_reason), UsageEvent(token_usage)])
         yield batch
-
 
 def collect(body, stop_event=None):
     return list(stream(body, stream=False, stop_event=stop_event))

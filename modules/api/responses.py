@@ -5,6 +5,7 @@ History is bounded, process-local CPU memory; it never manages the model KV cach
 import copy
 import asyncio
 import json
+import os
 import threading
 import time
 import uuid
@@ -20,6 +21,17 @@ from .typing import GenerationRequestOptions, GenerationOptions
 from .canonical_items import ConversationState, render_items as input_messages
 from .generation_events import EventBatch, StartedEvent, TextDelta, ReasoningDelta, ToolCallDelta, DoneEvent, UsageEvent
 from .responses_tools import ToolOutputError, custom_function, custom_input, strict_validator
+from modules.logging_colors import logger
+from modules import shared
+from .responses_format import prepare_format, validate_output
+
+
+RESPONSES_AUTO_CONTEXT_TOKENS = int(os.environ.get('TEXTGEN_RESPONSES_AUTO_CONTEXT_TOKENS', '260096'))
+
+
+def _validate_structured_response(request):
+    """Structured output applies only to answer-only Responses turns."""
+    return not (request.tools and request.tool_choice != 'none')
 
 
 class ResponsesRequest(GenerationOptions):
@@ -39,7 +51,10 @@ class ResponsesRequest(GenerationOptions):
     metadata: dict[str, str] = Field(default_factory=dict)
     text: dict | None = None
     reasoning: dict | None = None
-    truncation: Literal['disabled', 'auto'] = 'disabled'
+    # Local model context is finite; automatically keep the most recent
+    # conversation when clients omit this field.  Callers that require strict
+    # no-truncation validation can still send truncation="disabled".
+    truncation: Literal['disabled', 'auto'] = 'auto'
     background: bool = False
     include: list[str] = Field(default_factory=list)
     service_tier: str | None = None
@@ -61,16 +76,19 @@ class ResponseStore:
         self.entries = OrderedDict()
         self.bytes = 0
         self.lock = threading.Lock()
+        self.hits = self.misses = self.evictions = self.expirations = 0
 
     def _drop(self, key):
         _, size, _ = self.entries.pop(key)
         self.bytes -= size
+        self.evictions += 1
 
     def _expire(self):
         now = self.clock()
         for key, (expires, _, _) in list(self.entries.items()):
             if expires <= now:
                 self._drop(key)
+                self.expirations += 1
 
     def put(self, response, history, *, input_count=None):
         # Stored snapshots are never mutated. Copy outside the lock so a large
@@ -88,16 +106,31 @@ class ResponseStore:
                 self._drop(next(iter(self.entries)))
             self.entries[response['id']] = (self.clock() + self.ttl, size, data)
             self.bytes += size
+            logger.info('Responses cache store id=%s size=%d entries=%d/%d bytes=%d/%d',
+                        response['id'], size, len(self.entries), self.max_entries,
+                        self.bytes, self.max_bytes)
 
     def _snapshot(self, response_id):
         with self.lock:
             self._expire()
             if response_id not in self.entries:
+                self.misses += 1
                 invalid('Response not found, expired, evicted, or created with store=false.', 'response_id', 404)
             # Read/chain access marks the entry most-recently-used so an
             # active conversation survives FIFO-style eviction by idle ones.
             self.entries.move_to_end(response_id)
+            self.hits += 1
+            logger.debug('Responses cache hit id=%s entries=%d bytes=%d', response_id, len(self.entries), self.bytes)
             return self.entries[response_id][2]
+
+    def stats(self):
+        """Return lightweight response-cache statistics for diagnostics."""
+        with self.lock:
+            self._expire()
+            return {'entries': len(self.entries), 'bytes': self.bytes,
+                    'max_entries': self.max_entries, 'max_bytes': self.max_bytes,
+                    'hits': self.hits, 'misses': self.misses,
+                    'evictions': self.evictions, 'expirations': self.expirations}
 
     def get(self, response_id, *, field=None):
         data = self._snapshot(response_id)
@@ -328,10 +361,9 @@ def prepare(request, store=STORE):
         invalid('Service tiers are not available for local generation.', 'service_tier')
     if request.stream_options and request.stream_options != {'include_obfuscation': False}:
         invalid('Only stream_options.include_obfuscation=false is supported.', 'stream_options')
+    output_grammar = prepare_format(request.text, shared.args.loader)
     if request.text:
         _fields(request.text, 'format verbosity', 'text')
-        if request.text.get('format', {'type': 'text'}) != {'type': 'text'}:
-            invalid('Only text.format.type=text is supported; JSON Schema is unavailable.', 'text')
         if request.text.get('verbosity') not in (None, 'low', 'medium', 'high'):
             invalid('Unsupported text verbosity.', 'text.verbosity')
     if request.reasoning:
@@ -351,7 +383,12 @@ def prepare(request, store=STORE):
     for index, tool in enumerate(function_definitions(request.tools)):
         param = f'tools.{index}'
         if tool.get('type') in ('web_search', 'web_search_preview', 'file_search', 'computer_use_preview'):
-            invalid('Hosted tools are not supported by the local Responses backend.', param)
+            # OpenAI clients (including Codex) may advertise hosted tools by
+            # default.  They are executed by OpenAI's service and cannot be
+            # handled by this local server, so omit them from the local
+            # generation request instead of rejecting the whole request.
+            # Client-executed function tools below remain fully supported.
+            continue
         if tool.get('type') == 'custom':
             _fields(tool, 'type name description format', param)
             _string(tool, 'name', param)
@@ -385,6 +422,14 @@ def prepare(request, store=STORE):
         tools.append({'type': 'function', 'function': {'name': name, 'description': tool.get('description'), 'parameters': parameters}})
 
     history = []
+    if output_grammar is not None and tools and request.tool_choice != 'none':
+        # A single grammar cannot safely constrain both native tool markup and
+        # the eventual JSON answer.  Tool-capable clients (notably Codex)
+        # commonly send both fields together, so preserve tool execution and
+        # fall back to ordinary answer text for this turn instead of rejecting
+        # the request before generation starts.
+        logger.warning('Responses json_schema ignored while %d function tools are active; tool protocol takes precedence', len(tools))
+        output_grammar = None
     if request.previous_response_id:
         history = store.get(request.previous_response_id, field='history')
     # Validate before canonicalizing. Keep the public item types and IDs for
@@ -417,6 +462,45 @@ def prepare(request, store=STORE):
         messages.insert(0, {'role': 'system', 'content': (
             'Keep the final answer concise.' if verbosity == 'low' else 'Give a detailed final answer.')})
     params = {key: value for key, value in body.items() if key in GenerationOptions.model_fields}
+    if request.truncation == 'auto':
+        # A model may expose a 260k context, but feeding hundreds of thousands
+        # of old Codex messages through prefill makes the API appear frozen.
+        # Keep automatic local requests responsive; callers needing the full
+        # window can opt into truncation="disabled" explicitly.
+        requested_output = request.max_output_tokens or 512
+        output_reserve = max(512, requested_output) + 128
+        # ExLlamaV3 clamps max_new_tokens to the space left after the actual
+        # prompt. Do not subtract output space here: doing so truncated valid
+        # prompts thousands of tokens before the loaded context limit.
+        model_limit = getattr(getattr(shared.model, 'generator', None), 'max_total_tokens', None)
+        if not model_limit:
+            model_limit = getattr(shared.args, 'ctx_size', 0) or shared.settings['truncation_length']
+        params['truncation_length'] = min(model_limit, RESPONSES_AUTO_CONTEXT_TOKENS)
+        logger.info('Responses auto context budget: prompt_tokens=%d output_reserve=%d',
+                    params['truncation_length'], output_reserve)
+    # Local Responses requests should not silently inherit the UI's global
+    # thinking setting.  A Codex request that does not explicitly ask for
+    # reasoning otherwise spends a long time producing hidden Qwen thinking
+    # tokens before its first visible answer token.  Explicit medium/high
+    # effort still opts in; none/minimal/low are handled as fast mode.
+    effort = (request.reasoning or {}).get('effort')
+    if effort in ('none', 'minimal'):
+        params['enable_thinking'] = False
+        params['reasoning_effort'] = 'none'
+        logger.info('Responses local fast mode: enable_thinking=false effort=%s tools=%d', effort, len(tools))
+    elif effort == 'low':
+        # Qwen3's low effort is still a real thinking mode.  Preserve it so
+        # Codex requests retain the model's tool-selection/reasoning behavior;
+        # only explicit none/minimal disables thinking.
+        params['enable_thinking'] = True
+        params['reasoning_effort'] = 'low'
+        logger.info('Responses local reasoning mode: enable_thinking=true effort=low tools=%d', len(tools))
+    if output_grammar is not None:
+        messages.insert(0, {'role': 'system', 'content':
+            'Return only a JSON object matching this schema, without markdown or reasoning:\n'
+            + json.dumps(request.text['format']['schema'], ensure_ascii=False)})
+        params['enable_thinking'] = False
+        params['ban_eos_token'] = False
     params.update(messages=messages, model=request.model, max_tokens=request.max_output_tokens,
                   stream=request.stream, stream_options={'include_usage': True}, tools=tools,
                   tool_choice=request.tool_choice)
@@ -438,6 +522,9 @@ def prepare(request, store=STORE):
     converted['_responses_raise_errors'] = True
     converted['_responses_preserve_items'] = True
     converted['_responses_metrics'] = GenerationMetrics()
+    if output_grammar is not None:
+        converted['_responses_output_grammar'] = output_grammar
+        logger.info('Responses structured output enabled: loader=ExLlamav3 format=json_schema')
     return converted, history
 
 
@@ -448,7 +535,7 @@ def new_response(request, model):
             'parallel_tool_calls': request.parallel_tool_calls, 'previous_response_id': request.previous_response_id,
             'reasoning': {'effort': (request.reasoning or {}).get('effort'), 'summary': None}, 'store': request.store,
             'temperature': request.temperature, 'top_p': request.top_p,
-            'text': {'format': {'type': 'text'}, **({'verbosity': request.text['verbosity']} if request.text and 'verbosity' in request.text else {})},
+            'text': copy.deepcopy({'format': {'type': 'text'}, **(request.text or {})}),
             'tool_choice': request.tool_choice, 'tools': request.tools, 'truncation': request.truncation,
             'usage': None, 'metadata': request.metadata, 'user': request.user, 'background': False}
 
@@ -494,6 +581,8 @@ def from_chat(request, chat, history, store=STORE):
     if message.get('content') or not response['output']:
         response['output'].append(message_item(message.get('content') or '', 'incomplete' if choice['finish_reason'] == 'length' else 'completed'))
     complete_response(response, choice['finish_reason'], chat.get('usage'))
+    if _validate_structured_response(request):
+        validate_output(request, response)
     save_response(request, response, history, store)
     return response
 
@@ -516,7 +605,9 @@ class StreamConverter:
         # before the structured tool call arrives. Buffer that text so it is
         # never exposed as answer content. Native EventBatch generation does
         # not use this branch and remains fully streaming.
-        self.buffer_text = bool(request.tools) and request.tool_choice != 'none'
+        # Native generation emits separate TextDelta and ToolCallDelta events;
+        # text must remain incremental even when tools are advertised.
+        self.buffer_text = False
         self.pending_text = ''
 
     def event(self, kind, **data):
@@ -740,6 +831,8 @@ class StreamConverter:
                 self.event('response.output_item.done', output_index=self.message_index, item=self.message)])
         events = [event for index in sorted(groups) for event in groups[index]]
         complete_response(self.response, self.finish_reason, self.token_usage)
+        if _validate_structured_response(self.request):
+            validate_output(self.request, self.response)
         save_response(self.request, self.response, self.history, self.store)
         events.append(self.event('response.' + self.response['status'], response=self.response))
         return events

@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 
 logger = logging.getLogger('textgen')
@@ -61,6 +62,23 @@ def setup_logging():
     rb.setLevel(level)
     logger.addHandler(rb)
     logger.buffer = rb.buffer
+
+    # Persist Responses request diagnostics separately from the console and
+    # short in-memory ring buffer.  The response ID is included in every
+    # route-level record, so this file can be searched or tailed independently
+    # for one Codex request.
+    class ResponsesFileFilter(logging.Filter):
+        def filter(self, record):
+            return '[responses ' in record.getMessage()
+
+    log_dir = os.path.join('user_data', 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    responses_file = logging.FileHandler(os.path.join(log_dir, 'responses.log'), encoding='utf-8')
+    responses_file.setLevel(level)
+    responses_file.addFilter(ResponsesFileFilter())
+    responses_file.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(responses_file)
 
     # overrides
     logging.getLogger("urllib3").setLevel(logging.ERROR)

@@ -2,3 +2,4 @@
 lark==1.2.2
 jsonschema>=4.23,<5
 regex>=2024.11.6
+llguidance>=1.8,<2

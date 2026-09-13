@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from threading import Thread
 from typing import Literal
@@ -32,6 +33,9 @@ from modules import shared
 from modules.logging_colors import logger
 from modules.models import unload_model
 from modules.text_generation import stop_everything_event  # used by /v1/internal/stop-generation
+
+_ACTIVE_RESPONSES = {}
+_ACTIVE_RESPONSES_LOCK = threading.Lock()
 
 from .typing import (
     AnthropicRequest,
@@ -270,20 +274,117 @@ async def openai_chat_completions(request: Request, request_data: ChatCompletion
 # How often a queued streaming request announces itself while waiting for
 # the single local generation slot.
 RESPONSES_QUEUE_PING_SECONDS = 15.0
+# A local model can legitimately spend a while in prompt prefill, but once a
+# stream has started an entirely silent backend is almost always a stuck
+# worker (or an unsupported model/template combination).  Bound the wait for
+# each synchronous iterator step so an API client never hangs forever.
+RESPONSES_GENERATION_IDLE_TIMEOUT = float(os.environ.get('TEXTGEN_RESPONSES_IDLE_TIMEOUT', '180'))
+RESPONSES_STREAM_HEARTBEAT_SECONDS = float(os.environ.get('TEXTGEN_RESPONSES_HEARTBEAT_SECONDS', '10'))
+
+
+async def _responses_chunks(response, stop_event):
+    """Yield backend chunks while enforcing an idle timeout.
+
+    ``iterate_in_threadpool`` cannot time out the synchronous ``next()`` call
+    used by local backends.  Running each step in a worker lets us wake the
+    request task, signal cancellation, and return a useful error instead.
+    """
+    iterator = iter(response)
+    sentinel = object()
+
+    def next_chunk():
+        return next(iterator, sentinel)
+
+    # Keep the synchronous ``next`` call in one task.  Cancelling a
+    # ``to_thread`` await does not cancel the model worker, so repeatedly
+    # creating calls here could overlap generations.  Waiting in short
+    # intervals lets us emit an SSE comment while the same call is in flight.
+    next_task = None
+    idle_started = asyncio.get_running_loop().time()
+    try:
+      while not stop_event.is_set():
+        if next_task is None:
+            next_task = asyncio.create_task(asyncio.to_thread(next_chunk))
+        try:
+            done, _ = await asyncio.wait((next_task,), timeout=RESPONSES_STREAM_HEARTBEAT_SECONDS)
+            if not done:
+                if asyncio.get_running_loop().time() - idle_started >= RESPONSES_GENERATION_IDLE_TIMEOUT:
+                    stop_event.set()
+                    raise OpenAIError('Local generation produced no output for '
+                                      f'{RESPONSES_GENERATION_IDLE_TIMEOUT:g} seconds; generation was stopped.')
+                yield {'__responses_heartbeat__': True}
+                continue
+            chunk = next_task.result()
+            next_task = None
+        except StopIteration:
+            return
+        if chunk is sentinel:
+            return
+        idle_started = asyncio.get_running_loop().time()
+        yield chunk
+    finally:
+        if next_task is not None and not next_task.done():
+            stop_event.set()
 
 
 @app.post('/v1/responses', dependencies=check_key)
 async def openai_responses(request: Request, request_data: Responses.ResponsesRequest):
+    request_id = uuid.uuid4().hex[:12]
+    started = time.perf_counter()
+    logger.info('[responses %s] received stream=%s model=%s tools=%d input_type=%s',
+                request_id, request_data.stream, request_data.model,
+                len(request_data.tools or []), type(request_data.input).__name__)
     # Validate and resolve history before returning HTTP 200 / starting SSE.
-    converted, history = await asyncio.to_thread(Responses.prepare, request_data)
+    try:
+        converted, history = await asyncio.to_thread(Responses.prepare, request_data)
+    except Exception:
+        logger.exception('[responses %s] request validation/prepare failed after %.2fs',
+                         request_id, time.perf_counter() - started)
+        raise
+    logger.info('[responses %s] prepared after %.2fs history_items=%d',
+                request_id, time.perf_counter() - started, len(history))
     stop_event = threading.Event()
     if request_data.stream:
         async def generator():
             converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
+            response_id = converter.response['id']
+            with _ACTIVE_RESPONSES_LOCK:
+                _ACTIVE_RESPONSES[response_id] = stop_event
+            first_wire_text_at = None
+            first_wire_tool_at = None
+            first_wire_completion_at = None
+            captured = {'text': [], 'reasoning': [], 'tool_arguments': []}
+            captured_chars = 0
+
+            def capture(event):
+                nonlocal captured_chars
+                if captured_chars >= 20000:
+                    return
+                kind = event.get('event', '')
+                target = ('text' if kind == 'response.output_text.delta' else
+                          'reasoning' if kind == 'response.reasoning_summary_text.delta' else
+                          'tool_arguments' if kind in ('response.function_call_arguments.delta',
+                                                        'response.custom_tool_call_input.delta') else None)
+                if target is None:
+                    return
+                try:
+                    value = str(json.loads(event.get('data', '{}')).get('delta', ''))
+                except (TypeError, ValueError):
+                    return
+                value = value[:20000 - captured_chars]
+                captured[target].append(value)
+                captured_chars += len(value)
+
+            def log_captured(status):
+                if captured_chars:
+                    logger.info('[responses %s] output status=%s text=%r reasoning=%r tool_arguments=%r',
+                                request_id, status, ''.join(captured['text']),
+                                ''.join(captured['reasoning']), ''.join(captured['tool_arguments']))
             for event in converter.created():
                 yield event
             ticket = await Responses.GENERATION_QUEUE.acquire()
             try:
+                logger.info('[responses %s] stream admitted to queue after %.2fs', request_id, time.perf_counter() - started)
                 # The local model serves one generation at a time. A queued
                 # request keeps its stream alive and announces itself instead
                 # of hanging, so clients can follow up (for example with a
@@ -292,42 +393,75 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
                     for event in converter.queued():
                         yield event
                 if stop_event.is_set():
+                    logger.warning('[responses %s] stream cancelled while queued after %.2fs', request_id, time.perf_counter() - started)
                     # A client waiting in the queue must not hang on an empty
                     # stream when the request is never generated.
                     yield converter.failed('Server is busy; the request was not generated.', 'server_error')
                     return
                 for event in converter.admitted():
                     yield event
-                # Production uses native semantic events. The mock hook keeps
-                # legacy integrations and the test harness injectable without
-                # affecting normal requests.
-                if hasattr(OAIcompletions.stream_chat_completions, 'mock_calls'):
-                    response = OAIcompletions.stream_chat_completions(converted, stop_event=stop_event)
-                else:
-                    response = NativeGeneration.stream(converted, stream=True, stop_event=stop_event)
+                # Responses is a native protocol endpoint. Always use the
+                # semantic event generator; legacy Chat Completions adapters
+                # must never be selected for this route.
+                response = NativeGeneration.stream(converted, stream=True, stop_event=stop_event)
+                logger.info('[responses %s] generation started after %.2fs', request_id, time.perf_counter() - started)
                 try:
-                    async for chunk in iterate_in_threadpool(response):
+                    async for chunk in _responses_chunks(response, stop_event):
                         if stop_event.is_set():
                             return
+                        if isinstance(chunk, dict) and chunk.get('__responses_heartbeat__'):
+                            # SSE comments reset intermediary/client idle
+                            # timers without changing the Responses event
+                            # sequence or response state.
+                            yield {'comment': 'keep-alive'}
+                            continue
                         for event in converter.process(chunk):
+                            event_kind = event.get('event')
+                            now = time.perf_counter()
+                            if event_kind == 'response.output_text.delta' and first_wire_text_at is None:
+                                first_wire_text_at = now
+                                logger.info('[responses %s] first text delta after %.2fs',
+                                            request_id, now - started)
+                            elif event_kind in ('response.function_call_arguments.delta',
+                                                'response.custom_tool_call_input.delta') and first_wire_tool_at is None:
+                                first_wire_tool_at = now
+                                logger.info('[responses %s] first tool-call delta after %.2fs',
+                                            request_id, now - started)
+                            capture(event)
                             yield event
                     if not stop_event.is_set():
                         # Grammar/schema validation and history snapshots can
                         # be expensive; keep queue pings and disconnects live.
-                        for event in await asyncio.to_thread(converter.finish):
+                        terminal_events = await asyncio.to_thread(converter.finish)
+                        for event in terminal_events:
+                            if event.get('event') == 'response.completed' and first_wire_completion_at is None:
+                                first_wire_completion_at = time.perf_counter()
+                                logger.info('[responses %s] response.completed after %.2fs',
+                                            request_id, first_wire_completion_at - started)
                             yield event
+                        elapsed = time.perf_counter() - started
+                        logger.info('[responses %s] stream completed in %.2fs', request_id, elapsed)
+                        log_captured('completed')
                 except OpenAIError as error:
+                    log_captured('failed')
+                    logger.warning('[responses %s] generation OpenAIError after %.2fs: %s', request_id, time.perf_counter() - started, error)
                     yield converter.failed(error.message, 'invalid_prompt' if error.code < 500 else 'server_error')
                 except Responses.ToolOutputError as error:
+                    log_captured('failed')
+                    logger.warning('[responses %s] tool output error after %.2fs: %s', request_id, time.perf_counter() - started, error)
                     yield converter.failed(str(error), 'model_output_invalid')
                 except Exception:
+                    log_captured('failed')
                     logger.exception('Responses generation failed')
                     yield converter.failed('Local generation failed; check the server log.')
                 finally:
                     stop_event.set()
                     response.close()
             finally:
+                with _ACTIVE_RESPONSES_LOCK:
+                    _ACTIVE_RESPONSES.pop(response_id, None)
                 Responses.GENERATION_QUEUE.release(ticket)
+                logger.info('[responses %s] queue slot released total=%.2fs', request_id, time.perf_counter() - started)
         return GenerationEventSourceResponse(generator(), stop_event, sep='\n')
 
     monitor = asyncio.create_task(_wait_for_disconnect(request, stop_event))
@@ -335,8 +469,6 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
         async with Responses.GENERATION_QUEUE.slot(stop_event) as admitted:
             if admitted:
                 def native_response():
-                    if hasattr(OAIcompletions.chat_completions, 'mock_calls'):
-                        return OAIcompletions.chat_completions(converted, stop_event=stop_event)
                     converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
                     for batch in NativeGeneration.stream(converted, stream=False, stop_event=stop_event):
                         converter.process(batch)
@@ -357,9 +489,7 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
             if stop_event.is_set():
                 # A disconnected request must not persist a partial generation as completed.
                 return JSONResponse(status_code=499, content={'error': {'message': 'Client disconnected', 'type': 'server_error', 'param': None, 'code': None}})
-            if isinstance(result, dict) and result.get('object') == 'response':
-                return JSONResponse(result)
-            return JSONResponse(Responses.from_chat(request_data, result, history))
+            return JSONResponse(result)
     except OpenAIError:
         raise
     except Responses.ToolOutputError as error:
@@ -370,6 +500,7 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
     finally:
         stop_event.set()
         monitor.cancel()
+        logger.info('[responses %s] request finished total=%.2fs', request_id, time.perf_counter() - started)
 
 
 @app.get('/v1/responses/{response_id}/input_items', dependencies=check_key)
@@ -382,6 +513,12 @@ async def list_response_input_items(response_id: str, after: str | None = None,
         response_id, after=after, limit=limit, order=order, include=(include or []) + (include_brackets or []))))
 
 
+@app.get('/v1/responses/_cache_stats', dependencies=check_key)
+async def response_cache_stats():
+    """Local diagnostic endpoint; reports in-memory response snapshot cache."""
+    return JSONResponse({'object': 'responses.cache_stats', **Responses.STORE.stats()})
+
+
 @app.get('/v1/responses/{response_id}', dependencies=check_key)
 async def retrieve_response(response_id: str):
     return await asyncio.to_thread(lambda: JSONResponse(Responses.STORE.get(response_id, field='response')))
@@ -389,6 +526,18 @@ async def retrieve_response(response_id: str):
 
 @app.delete('/v1/responses/{response_id}', dependencies=check_key)
 async def delete_response(response_id: str):
+    with _ACTIVE_RESPONSES_LOCK:
+        active_stop = _ACTIVE_RESPONSES.get(response_id)
+    if active_stop is not None:
+        active_stop.set()
+        logger.info('[responses %s] cancellation requested by DELETE', response_id)
+        # An in-flight response is not persisted until completion, but DELETE
+        # must still acknowledge the cancellation instead of returning 404.
+        try:
+            return JSONResponse({'id': response_id, 'object': 'response.deleted', 'deleted': True})
+        finally:
+            with _ACTIVE_RESPONSES_LOCK:
+                _ACTIVE_RESPONSES.pop(response_id, None)
     return JSONResponse(Responses.STORE.delete(response_id))
 
 
