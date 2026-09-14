@@ -325,6 +325,17 @@ async def _responses_chunks(response, stop_event):
     finally:
         if next_task is not None and not next_task.done():
             stop_event.set()
+            # ``to_thread`` cancellation only detaches the awaiter; the
+            # synchronous native generation call keeps running.  Drain that
+            # task before the caller closes the response, otherwise the model
+            # can be torn down while Torch is still inside a CPU/CUDA op.
+            try:
+                await asyncio.shield(next_task)
+            except (asyncio.CancelledError, StopIteration, Exception):
+                # The result is intentionally ignored during disconnect or
+                # cancellation; waiting for worker termination is the safety
+                # requirement here.
+                pass
 
 
 @app.post('/v1/responses', dependencies=check_key)
@@ -403,6 +414,12 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
                 # Responses is a native protocol endpoint. Always use the
                 # semantic event generator; legacy Chat Completions adapters
                 # must never be selected for this route.
+                # ExLlamaV3 shares mutable native/GPU state with Chat and
+                # Completions. Acquire the process-wide lock in a worker
+                # thread so a competing request never blocks the event loop.
+                generation_lock = shared.generation_lock
+                if generation_lock is not None:
+                    await asyncio.to_thread(generation_lock.acquire)
                 response = NativeGeneration.stream(converted, stream=True, stop_event=stop_event)
                 logger.info('[responses %s] generation started after %.2fs', request_id, time.perf_counter() - started)
                 try:
@@ -457,6 +474,8 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
                 finally:
                     stop_event.set()
                     response.close()
+                    if generation_lock is not None:
+                        generation_lock.release()
             finally:
                 with _ACTIVE_RESPONSES_LOCK:
                     _ACTIVE_RESPONSES.pop(response_id, None)
@@ -469,11 +488,18 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
         async with Responses.GENERATION_QUEUE.slot(stop_event) as admitted:
             if admitted:
                 def native_response():
+                    generation_lock = shared.generation_lock
+                    if generation_lock is not None:
+                        generation_lock.acquire()
                     converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
-                    for batch in NativeGeneration.stream(converted, stream=False, stop_event=stop_event):
-                        converter.process(batch)
-                    converter.finish()
-                    return converter.response
+                    try:
+                        for batch in NativeGeneration.stream(converted, stream=False, stop_event=stop_event):
+                            converter.process(batch)
+                        converter.finish()
+                        return converter.response
+                    finally:
+                        if generation_lock is not None:
+                            generation_lock.release()
                 worker = asyncio.create_task(asyncio.to_thread(native_response))
                 try:
                     result = await asyncio.shield(worker)

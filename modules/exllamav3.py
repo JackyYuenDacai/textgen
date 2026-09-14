@@ -33,6 +33,7 @@ from modules import shared
 from modules.exllamav3_cache import ImageEmbeddingCache
 from modules.exllamav3_drafting import drafting_options
 from modules.exllamav3_diagnostics import memory_snapshot, recurrent_options, recurrent_snapshot
+from modules.tokenizer_worker import IsolatedTokenizerEncoder
 from modules.exllamav3_memory import MemoryPressureGuard
 from modules.exllamav3_prefill import PrefillJobMixin
 from modules.image_utils import (
@@ -363,6 +364,11 @@ class Exllamav3Model:
         result = cls()
         result.model = model
         result.cache = cache
+        # Rust tokenizers have been observed to take down the Windows host
+        # process during concurrent/large ``encode`` calls. Keep model
+        # inference in this process, but isolate the unsafe encoder in a tiny
+        # subprocess so a native fault only loses the current request.
+        tokenizer.tokenizer = IsolatedTokenizerEncoder(tokenizer.tokenizer)
         result.tokenizer = tokenizer
         result.generator = generator
         result.parallel_generator = ConcurrentGenerator(generator)
@@ -851,6 +857,14 @@ class Exllamav3Model:
 
     def unload(self):
         logger.info("Unloading ExLlamaV3 model components...")
+
+        if self.tokenizer is not None:
+            try:
+                backend = getattr(self.tokenizer, 'tokenizer', None)
+                if hasattr(backend, 'close'):
+                    backend.close()
+            except Exception as e:
+                logger.warning(f"Error stopping tokenizer worker: {e}")
 
         if self.parallel_generator is not None:
             try:

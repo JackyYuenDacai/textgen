@@ -607,7 +607,11 @@ class StreamConverter:
         # not use this branch and remains fully streaming.
         # Native generation emits separate TextDelta and ToolCallDelta events;
         # text must remain incremental even when tools are advertised.
-        self.buffer_text = False
+        # Legacy chat adapters may emit tool markup as ordinary text before
+        # the structured tool call arrives.  When tools are advertised, hold
+        # text until the turn is classified; tool turns discard the markup,
+        # while ordinary answer turns flush it at completion.
+        self.buffer_text = bool(request.tools and request.tool_choice != 'none')
         self.pending_text = ''
 
     def event(self, kind, **data):
@@ -808,10 +812,13 @@ class StreamConverter:
                                         arguments=item['arguments'], name=item['name'])]
                 group.append(self.event('response.output_item.done', output_index=index, item=item))
                 groups.setdefault(index, []).extend(group)
-        elif self.pending_text or not self.response['output']:
+        elif self.pending_text:
             # Buffered text creates its item now; its open events join the
             # item's group so the stream stays in output order.
-            groups[self.message_index] = self.add_text(self.pending_text)
+            groups[0] = self.add_text(self.pending_text)
+        elif not self.response['output']:
+            # Preserve the Responses contract for an empty completion.
+            groups[0] = self.add_text('')
         if self.reasoning is not None:
             part = self.reasoning['content'][0]
             groups.setdefault(self.reasoning_index, []).extend([

@@ -22,11 +22,14 @@ def generate_reply(*args, **kwargs):
     state = args[1] if len(args) > 1 else kwargs.get('state', {})
     use_parallel = (
         state.get('stop_event') is not None
-        and shared.model.__class__.__name__ in ['Exllamav3Model', 'LlamaServer', 'TensorRTLLMModel']
+        # ExLlamaV3's native model/cache is not safe to overlap with other
+        # API generations on Windows. Keep its stop_event support, but hold
+        # the process-wide generation lock for the whole request.
+        and shared.model.__class__.__name__ in ['LlamaServer', 'TensorRTLLMModel']
         and (shared.model.__class__.__name__ != 'LlamaServer' or shared.args.parallel > 1)
     )
 
-    if not use_parallel:
+    if not use_parallel and shared.generation_lock is not None:
         shared.generation_lock.acquire()
 
     with models._generation_count_lock:
@@ -40,7 +43,7 @@ def generate_reply(*args, **kwargs):
             models.active_generation_count -= 1
 
         models.last_generation_time = time.time()
-        if not use_parallel:
+        if not use_parallel and shared.generation_lock is not None:
             shared.generation_lock.release()
 
 
