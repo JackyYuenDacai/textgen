@@ -27,6 +27,8 @@ from .responses_format import prepare_format, validate_output
 
 
 RESPONSES_AUTO_CONTEXT_TOKENS = int(os.environ.get('TEXTGEN_RESPONSES_AUTO_CONTEXT_TOKENS', '260096'))
+RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS = int(
+    os.environ.get('TEXTGEN_RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS', '32768'))
 
 
 def _validate_structured_response(request):
@@ -467,7 +469,8 @@ def prepare(request, store=STORE):
         # of old Codex messages through prefill makes the API appear frozen.
         # Keep automatic local requests responsive; callers needing the full
         # window can opt into truncation="disabled" explicitly.
-        requested_output = request.max_output_tokens or 512
+        requested_output = request.max_output_tokens or (
+            RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS if output_grammar is not None else 512)
         output_reserve = max(512, requested_output) + 128
         # ExLlamaV3 clamps max_new_tokens to the space left after the actual
         # prompt. Do not subtract output space here: doing so truncated valid
@@ -501,7 +504,15 @@ def prepare(request, store=STORE):
             + json.dumps(request.text['format']['schema'], ensure_ascii=False)})
         params['enable_thinking'] = False
         params['ban_eos_token'] = False
-    params.update(messages=messages, model=request.model, max_tokens=request.max_output_tokens,
+    # Local generation defaults are intentionally conservative for ordinary
+    # text, but that default frequently truncates valid structured documents.
+    # Give schema constrained turns enough room unless the caller supplied an
+    # explicit ceiling; the grammar still stops as soon as the object closes.
+    effective_max_tokens = request.max_output_tokens
+    if effective_max_tokens is None and output_grammar is not None:
+        effective_max_tokens = RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS
+        logger.info('Responses structured output default max_tokens=%d', effective_max_tokens)
+    params.update(messages=messages, model=request.model, max_tokens=effective_max_tokens,
                   stream=request.stream, stream_options={'include_usage': True}, tools=tools,
                   tool_choice=request.tool_choice)
     for key in ('temperature', 'top_p'):
