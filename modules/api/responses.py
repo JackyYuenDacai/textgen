@@ -29,6 +29,10 @@ from .responses_format import prepare_format, validate_output
 RESPONSES_AUTO_CONTEXT_TOKENS = int(os.environ.get('TEXTGEN_RESPONSES_AUTO_CONTEXT_TOKENS', '260096'))
 RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS = int(
     os.environ.get('TEXTGEN_RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS', '32768'))
+# Qwen3.8-27B local recommendation: allow up to 131,072 visible output
+# tokens; internal reasoning can consume the remainder of the 262,144 window.
+RESPONSES_DEFAULT_OUTPUT_TOKENS = int(
+    os.environ.get('TEXTGEN_RESPONSES_DEFAULT_OUTPUT_TOKENS', '131072'))
 
 
 def _validate_structured_response(request):
@@ -459,6 +463,24 @@ def prepare(request, store=STORE):
         messages.insert(0, {'role': 'system', 'content': request.instructions})
     if tools and request.tool_choice != 'none' and not request.parallel_tool_calls:
         messages.insert(0, {'role': 'system', 'content': 'Call at most one tool per response. Wait for its result before calling another tool.'})
+    elif tools and request.tool_choice != 'none':
+        # Codex/WorkBuddy expects a complete task, not an intermediate plan.
+        # Local models otherwise often stop after the first search and return
+        # a progress note even though the user asked for repeated tool work.
+        messages.insert(0, {'role': 'system', 'content': (
+            'Continue working until the user request is actually complete. '
+            'Progress updates are not a final answer. After each tool result, '
+            'inspect it and call the next tool whenever more work remains; '
+            'do not stop merely because a plan, TaskUpdate, or partial batch '
+            'is ready. If the user asks for N items or batches, perform every '
+            'one (including the remaining batches after the first) before '
+            'answering. A message saying “first batch”, “开始逐条”, “继续”, '
+            'or “已找到” is progress and must be followed by more tool calls. '
+            'Never finish with uncertainty, inability to recall configuration, '
+            'or a promise to check documentation: use Bash, WebSearch, or the '
+            'other available tools to check it first. After tools return, cite '
+            'their concrete result and complete the requested deliverable. '
+            'Only provide the final answer after all requested items are done.')})
     verbosity = (request.text or {}).get('verbosity')
     if verbosity in ('low', 'high'):
         messages.insert(0, {'role': 'system', 'content': (
@@ -470,7 +492,7 @@ def prepare(request, store=STORE):
         # Keep automatic local requests responsive; callers needing the full
         # window can opt into truncation="disabled" explicitly.
         requested_output = request.max_output_tokens or (
-            RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS if output_grammar is not None else 512)
+            RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS if output_grammar is not None else RESPONSES_DEFAULT_OUTPUT_TOKENS)
         output_reserve = max(512, requested_output) + 128
         # ExLlamaV3 clamps max_new_tokens to the space left after the actual
         # prompt. Do not subtract output space here: doing so truncated valid
@@ -508,7 +530,7 @@ def prepare(request, store=STORE):
     # text, but that default frequently truncates valid structured documents.
     # Give schema constrained turns enough room unless the caller supplied an
     # explicit ceiling; the grammar still stops as soon as the object closes.
-    effective_max_tokens = request.max_output_tokens
+    effective_max_tokens = request.max_output_tokens or RESPONSES_DEFAULT_OUTPUT_TOKENS
     if effective_max_tokens is None and output_grammar is not None:
         effective_max_tokens = RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS
         logger.info('Responses structured output default max_tokens=%d', effective_max_tokens)
@@ -532,6 +554,7 @@ def prepare(request, store=STORE):
     converted['_responses_no_truncation'] = request.truncation == 'disabled'
     converted['_responses_raise_errors'] = True
     converted['_responses_preserve_items'] = True
+    converted['_responses_parallel_tool_calls'] = request.parallel_tool_calls
     converted['_responses_metrics'] = GenerationMetrics()
     if output_grammar is not None:
         converted['_responses_output_grammar'] = output_grammar

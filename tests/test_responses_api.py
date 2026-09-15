@@ -320,7 +320,8 @@ class ResponsesTests(unittest.TestCase):
                 'format': {'type': 'grammar', 'syntax': 'lark', 'definition': '%import .private.VALUE\nstart: VALUE'}}]), self.store)
 
     def test_tool_backend_closed_before_terminal_chunk(self):
-        body, _ = api.prepare(api.ResponsesRequest(input='Read', tools=[{'type': 'function', 'name': 'f'}], stream=True), self.store)
+        body, _ = api.prepare(api.ResponsesRequest(input='Read', tools=[{'type': 'function', 'name': 'f'}], stream=True,
+                                                  parallel_tool_calls=False), self.store)
         closed = threading.Event()
         def backend(*args, **kwargs):
             body['_responses_metrics'].update(prompt_tokens=12, completion_tokens=4)

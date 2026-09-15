@@ -248,6 +248,12 @@ async def openai_chat_completions(request: Request, request_data: ChatCompletion
                     yield {"data": json.dumps(resp)}
 
                 yield {"data": "[DONE]"}
+            except Responses.ToolOutputError as error:
+                logger.warning('Chat completion tool output invalid: %s', error)
+                yield {'data': json.dumps({'error': {
+                    'message': str(error), 'type': 'server_error',
+                    'param': None, 'code': 'model_output_invalid'}})}
+                yield {'data': '[DONE]'}
             finally:
                 stop_event.set()
                 response.close()
@@ -264,6 +270,8 @@ async def openai_chat_completions(request: Request, request_data: ChatCompletion
                 is_legacy=is_legacy,
                 stop_event=stop_event
             )
+        except Responses.ToolOutputError as error:
+            raise OpenAIError(str(error)) from None
         finally:
             stop_event.set()
             monitor.cancel()
@@ -458,7 +466,7 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
                             yield event
                         elapsed = time.perf_counter() - started
                         logger.info('[responses %s] stream completed in %.2fs', request_id, elapsed)
-                        log_captured('completed')
+                        log_captured(converter.response['status'])
                 except OpenAIError as error:
                     log_captured('failed')
                     logger.warning('[responses %s] generation OpenAIError after %.2fs: %s', request_id, time.perf_counter() - started, error)

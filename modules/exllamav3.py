@@ -709,7 +709,7 @@ class Exllamav3Model:
             )
             if final_result is not None:
                 for key in ('time_enqueued', 'time_prefill', 'time_generate', 'cached_tokens', 'prompt_tokens',
-                            'new_tokens', 'accepted_draft_tokens', 'rejected_draft_tokens'):
+                            'new_tokens', 'accepted_draft_tokens', 'rejected_draft_tokens', 'eos_reason'):
                     if key in final_result:
                         metrics[key] = final_result[key]
                 gen_time = metrics.get('time_generate', 0)
@@ -737,7 +737,9 @@ class Exllamav3Model:
                     f"queue {metrics.get('time_enqueued', 0):.3f}s, "
                     f"images {metrics['image_seconds']:.3f}s, "
                     f"cached {metrics.get('cached_tokens', 0)}/{metrics.get('prompt_tokens', 0)} tokens, "
-                    f"draft acceptance {acceptance_label} ({accepted}/{attempted})"
+                    f"draft acceptance {acceptance_label} ({accepted}/{attempted}), "
+                    f"stop {metrics.get('eos_reason', 'unknown')}, "
+                    f"output {metrics.get('new_tokens', emitted_tokens)}/{max_new_tokens} tokens"
                 )
             self._record_performance(metrics)
 

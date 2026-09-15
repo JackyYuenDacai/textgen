@@ -302,7 +302,12 @@ def completions_common(body: dict, is_legacy: bool = False, stream=False, stop_e
 
 
 def chat_completions_common(body, is_legacy=False, stream=False, prompt_only=False, stop_event=None):
+    from .responses import GenerationMetrics
     body = dict(body)
+    # Keep loader token counts and stop causes through copied generation state
+    # for Chat clients as well as native Responses clients.
+    body.setdefault('_responses_metrics', GenerationMetrics())
+    body.setdefault('_responses_raise_errors', True)
     # Preserve the established monkey-patching/extension seam: generation
     # resolves backend hooks through this adapter's namespace.
     generation.generate_chat_reply = generate_chat_reply

@@ -196,6 +196,7 @@ class GenerationRequestOptions(GenerationOptions, GenerationRequestParams):
 
 class ChatCompletionRequestParams(GenerationRequestParams):
     messages: List[dict] = Field(..., min_length=1)
+    parallel_tool_calls: bool = True
 
 
 class ChatCompletionRequest(GenerationOptions, ChatCompletionRequestParams):

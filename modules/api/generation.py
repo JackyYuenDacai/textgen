@@ -13,6 +13,24 @@ from .generation_support import (_get_raw_logprob_entries, _dict_to_logprob_entr
                                 _compute_prompt_logprob_entries)
 import time
 from modules.logging_colors import logger
+from modules.tool_parsing import TOOL_CALL_OPENING_MARKERS, streaming_tool_buffer_check
+from .responses_tools import ToolOutputError
+
+
+def _visible_tool_prefix(content, markers, tool_names, check_bare_names, final=False):
+    """Keep prose before tool markup, including across split opening tokens."""
+    openings = list(TOOL_CALL_OPENING_MARKERS)
+    openings.extend(name + suffix for name in tool_names for suffix in ('{', ' {'))
+    end = min((content.index(marker) for marker in openings if marker in content), default=len(content))
+    if not final:
+        partials = list(markers)
+        if check_bare_names:
+            partials.extend(tool_names)
+        for marker in partials:
+            for size in range(1, min(len(marker), len(content) + 1)):
+                if content.endswith(marker[:size]):
+                    end = min(end, len(content) - size)
+    return content[:end]
 
 
 class GenerationState(Enum):
@@ -190,9 +208,11 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
     seen_reasoning = ''
 
     tool_calls = []
-    end_last_tool_call = 0
     supported_tools = [x["function"]["name"] for x in tools] if tools is not None else None
     _tool_parsers = None
+    _tool_markers = TOOL_CALL_OPENING_MARKERS
+    _check_bare_names = True
+    parallel_calls = body.get('_responses_parallel_tool_calls', body.get('parallel_tool_calls', True))
 
     # Filter supported_tools when tool_choice specifies a particular function
     if supported_tools and isinstance(tool_choice, dict):
@@ -202,7 +222,7 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
 
     if supported_tools is not None:
         _template_str = generate_params.get('instruction_template_str', '') if generate_params.get('mode') == 'instruct' else generate_params.get('chat_template_str', '')
-        _tool_parsers, _, _ = detect_tool_call_format(_template_str)
+        _tool_parsers, _tool_markers, _check_bare_names = detect_tool_call_format(_template_str)
 
     try:
         for a in generator:
@@ -212,40 +232,28 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
             answer = a['internal'][-1][1]
 
             if supported_tools is not None:
-                tool_call = parse_tool_call(answer[end_last_tool_call:], supported_tools, parsers=_tool_parsers) if len(answer) > 0 else []
+                tool_call = parse_tool_call(answer, supported_tools, parsers=_tool_parsers) if len(answer) > 0 else []
                 if len(tool_call) > 0:
                     if first_tool_call_at is None:
                         first_tool_call_at = time.perf_counter()
                         logger.info('Responses first tool-call delta after %.2fs',
                                     first_tool_call_at - generation_started_at)
-                    for tc in tool_call:
-                        tc["id"] = get_tool_call_id()
-                        if generate_params.get('_responses_raise_errors'):
-                            logger.info('Responses recognized tool call name=%s', tc.get('function', {}).get('name', ''))
-                            if debug_output:
-                                logger.info('Responses generated tool arguments: %r', str(tc.get('function', {}).get('arguments', ''))[:2000])
-                        if stream:
-                            tc["index"] = len(tool_calls)
-                        tc["function"]["arguments"] = json.dumps(tc["function"]["arguments"])
-                        tool_calls.append(tc)
+                    # The backend yields cumulative text. Replace the snapshot
+                    # so parallel calls are collected once, in generated order.
+                    tool_calls = tool_call
                     state = GenerationState.GENERATING_TOOL_CALL
-                    end_last_tool_call = len(answer)
 
-            # Stop generation before streaming content if tool_calls were detected,
-            # so that raw tool markup is not sent as content deltas.
-            if len(tool_calls) > 0:
+            # Single-call mode can release the backend immediately. Parallel
+            # mode must let the model finish the rest of its call batch.
+            if tool_calls and not parallel_calls:
                 break
-
-            # Tool markup is cumulative and cannot be parsed until the closing
-            # tag arrives. Never leak its prefix as answer text: clients such
-            # as Codex render that XML literally instead of executing it.
-            if supported_tools is not None and '<tool_call>' in answer:
-                continue
 
             if stream:
                 # Strip reasoning/thinking blocks so only final content is streamed.
                 # Reasoning is emitted separately as reasoning_content deltas.
                 reasoning, content = extract_reasoning(answer)
+                if supported_tools is not None:
+                    content = _visible_tool_prefix(content, _tool_markers, supported_tools, _check_bare_names)
                 if reasoning is not None:
                     state = GenerationState.GENERATING_REASONING
                     new_reasoning = reasoning[len(seen_reasoning):]
@@ -253,7 +261,7 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
                 else:
                     state = GenerationState.GENERATING_TEXT
                     new_reasoning = None
-                    new_content = answer[len(seen_content):]
+                    new_content = content[len(seen_content):]
 
                 if new_reasoning and first_reasoning_at is None:
                     first_reasoning_at = time.perf_counter()
@@ -278,25 +286,62 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
 
                 if reasoning is not None:
                     seen_reasoning = reasoning
-                    seen_content = content
-                else:
-                    seen_content = answer
+                seen_content = content
                 yield chunk
     finally:
-        # Responses can stop as soon as a complete tool call is recognized.
+        # Single-call Responses may stop as soon as a call is recognized.
         # Release the backend job before yielding the terminal API events,
         # including when the consumer closes or generation raises.
         if generate_params.get('_responses_raise_errors'):
             generator.close()
 
     response_metrics = generate_params.get('_responses_metrics', {})
+    if tool_calls and parallel_calls:
+        # Qwen's outer tag delimits each call. A valid first call must not
+        # hide a malformed or unfinished later member of the batch.
+        _, content = extract_reasoning(answer)
+        if '<tool_call>' in content:
+            blocks = content.split('<tool_call>')[1:]
+            if any(not parse_tool_call('<tool_call>' + block, supported_tools, parsers=_tool_parsers)
+                   for block in blocks):
+                if response_metrics.get('finish_reason') == 'length':
+                    tool_calls = []
+                else:
+                    # ``tool_choice=auto`` allows the model to decide not to
+                    # call a tool. If a marker is malformed, preserve the
+                    # prose prefix and complete the response rather than
+                    # turning a recoverable model output into HTTP 500.
+                    tool_calls = []
+    if supported_tools is not None and not tool_calls:
+        if streaming_tool_buffer_check(answer, tool_names=supported_tools, partial_match=False):
+            # Auto tool selection treats an unparsable marker as ordinary
+            # model text; the visible-tool-prefix filter below removes its
+            # markup while preserving the answer before it.
+            pass
+        if stream:
+            # A trailing partial marker may have been ordinary prose. Flush it
+            # at EOS, but keep real tool markup out of the answer.
+            _, content = extract_reasoning(answer)
+            content = _visible_tool_prefix(content, _tool_markers, supported_tools, _check_bare_names, final=True)
+            if content[len(seen_content):]:
+                yield semantic_batch(content=content[len(seen_content):])
+
+    for index, tc in enumerate(tool_calls):
+        tc['id'] = get_tool_call_id()
+        if stream:
+            tc['index'] = index
+        if generate_params.get('_responses_raise_errors'):
+            logger.info('Responses recognized tool call name=%s', tc['function']['name'])
+        tc['function']['arguments'] = json.dumps(tc['function']['arguments'])
     if 'prompt_tokens' in response_metrics:
         token_count = response_metrics['prompt_tokens']
         completion_token_count = response_metrics['completion_tokens']
     else:
         token_count = shared.model.last_prompt_token_count if hasattr(shared.model, 'last_prompt_token_count') else 0
         completion_token_count = len(encode(answer)[0])
-    if len(tool_calls) > 0:
+    if response_metrics.get('finish_reason') == 'length':
+        stop_reason = 'length'
+    elif len(tool_calls) > 0:
         stop_reason = "tool_calls"
         state = GenerationState.WAITING_FOR_TOOL_RESULT
     elif response_metrics.get('finish_reason'):
@@ -321,8 +366,10 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
     # the time spent serializing and delivering terminal Responses events.
     if '_responses_metrics' in generate_params:
         logger.info('Responses generation completed after %.2fs finish_reason=%s '
+                    'output_tokens=%d max_new_tokens=%s tool_calls=%d '
                     'backend_chunk=%s reasoning_delta=%s text_delta=%s tool_call_delta=%s',
                     time.perf_counter() - generation_started_at, stop_reason,
+                    completion_token_count, generate_params['max_new_tokens'], len(tool_calls),
                     first_backend_chunk_at is not None,
                     first_reasoning_at is not None,
                     first_text_at is not None,
@@ -335,6 +382,8 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
         yield EventBatch([UsageEvent(token_usage)])
     else:
         reasoning, content = extract_reasoning(answer)
+        if supported_tools is not None:
+            content = _visible_tool_prefix(content, _tool_markers, supported_tools, _check_bare_names, final=True)
         batch = semantic_batch(content=None if tool_calls else content,
                                reasoning_content=reasoning if reasoning else None,
                                chunk_tool_calls=tool_calls, include_role=True)

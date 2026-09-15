@@ -646,7 +646,7 @@ def parse_tool_call(answer: str, tool_names: list[str], return_prefix: bool = Fa
     # markup (<|start|>assistant…) follows the thinking block without a
     # content tag.  Fall back to the full text so tool-call markers can
     # be found.
-    if not answer.strip():
+    if not answer.strip() and '<|start|>assistant' in original_answer:
         answer = original_answer
         reasoning_offset = 0
     else:
