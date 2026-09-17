@@ -481,6 +481,21 @@ def prepare(request, store=STORE):
             'other available tools to check it first. After tools return, cite '
             'their concrete result and complete the requested deliverable. '
             'Only provide the final answer after all requested items are done.')})
+        # Place a second directive after the normal system/instruction setup so
+        # it remains prominent when long tool-result histories are replayed.
+        messages.append({'role': 'system', 'content': (
+            'MANDATORY COMPLETION POLICY: You are an execution agent. It is '
+            'never acceptable to stop at a plan, acknowledgement, status '
+            'update, first batch, partial result, or tool summary. Do not say '
+            '“it is okay to stop”, “I will continue later”, “I need to check”, '
+            'or equivalent. Do not ask the user to continue. If any requested '
+            'item, article, batch, verification, file operation, or answer '
+            'remains, immediately call the appropriate tool and continue. '
+            'After every tool result, count the completed versus requested work '
+            'and perform the next operation. You may finish only when every '
+            'requested operation is complete and you can present its concrete '
+            'result. This rule overrides conversational brevity and progress '
+            'reporting preferences.')})
     verbosity = (request.text or {}).get('verbosity')
     if verbosity in ('low', 'high'):
         messages.insert(0, {'role': 'system', 'content': (
