@@ -40,7 +40,7 @@ class GenerationState(Enum):
     WAITING_FOR_TOOL_RESULT = auto()
     COMPLETED = auto()
 
-def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False, stop_event=None) -> dict:
+def _stream_once(body: dict, is_legacy: bool = False, stream=False, prompt_only=False, stop_event=None) -> dict:
     if body.get('functions', []):
         raise InvalidRequestError(message="functions is not supported.", param='functions')
 
@@ -148,6 +148,13 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
         generate_params['max_new_tokens'] = 512
         generate_params['auto_max_new_tokens'] = True
 
+    # Recovery limits apply after presets and auto-token defaults.
+    ceiling = body.get('_generation_output_ceiling')
+    if ceiling is not None:
+        generate_params['max_new_tokens'] = (ceiling if generate_params['auto_max_new_tokens']
+                                              else min(generate_params['max_new_tokens'], ceiling))
+        generate_params['auto_max_new_tokens'] = False
+
     requested_model = generate_params.pop('model')
     logprob_proc = generate_params.pop('logprob_proc', None)
     if logprob_proc:
@@ -243,9 +250,9 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
                     tool_calls = tool_call
                     state = GenerationState.GENERATING_TOOL_CALL
 
-            # Single-call mode can release the backend immediately. Parallel
-            # mode must let the model finish the rest of its call batch.
-            if tool_calls and not parallel_calls:
+            # Recovery must validate the full turn, including single-call
+            # policy violations, before releasing any executable calls.
+            if tool_calls and not parallel_calls and '_generation_attempt' not in body:
                 break
 
             if stream:
@@ -296,6 +303,12 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
             generator.close()
 
     response_metrics = generate_params.get('_responses_metrics', {})
+    attempt_detail = body.get('_generation_attempt')
+    if attempt_detail is not None:
+        from .generation_recovery import malformed_output
+        attempt_detail.update(raw=answer, cancelled=shared.stop_everything,
+                              error=malformed_output(answer, tool_calls, supported_tools or [], _tool_parsers, parse_tool_call))
+
     if tool_calls and parallel_calls:
         # Qwen's outer tag delimits each call. A valid first call must not
         # hide a malformed or unfinished later member of the batch.
@@ -357,6 +370,9 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
         'completion_tokens': completion_token_count,
         'total_tokens': token_count + completion_token_count,
     }
+    if attempt_detail is not None:
+        attempt_detail['output_budget'] = (max(0, generate_params['truncation_length'] - token_count)
+                                           if generate_params['auto_max_new_tokens'] else generate_params['max_new_tokens'])
     if 'cached_tokens' in response_metrics:
         token_usage['prompt_tokens_details'] = {'cached_tokens': response_metrics['cached_tokens']}
 
@@ -398,6 +414,14 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
                 batch.logprobs = format_chat_logprobs(raw)
         batch.events.extend([DoneEvent(stop_reason), UsageEvent(token_usage)])
         yield batch
+
+def stream(body: dict, is_legacy=False, stream=False, prompt_only=False, stop_event=None):
+    if body.get('tools') and body.get('tool_choice') != 'none' and not prompt_only:
+        from .generation_recovery import recover
+        yield from recover(_stream_once, body, is_legacy=is_legacy, stream=stream, stop_event=stop_event)
+    else:
+        yield from _stream_once(body, is_legacy=is_legacy, stream=stream, prompt_only=prompt_only, stop_event=stop_event)
+
 
 def collect(body, stop_event=None):
     return list(stream(body, stream=False, stop_event=stop_event))

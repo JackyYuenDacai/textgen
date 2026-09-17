@@ -1,0 +1,614 @@
+diff --git a/modules/api/generation.py b/modules/api/generation.py
+index 5edb20d..286f92c 100644
+--- a/modules/api/generation.py
++++ b/modules/api/generation.py
+@@ -40,7 +40,7 @@ class GenerationState(Enum):
+     WAITING_FOR_TOOL_RESULT = auto()
+     COMPLETED = auto()
+ 
+-def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False, stop_event=None) -> dict:
++def _stream_once(body: dict, is_legacy: bool = False, stream=False, prompt_only=False, stop_event=None) -> dict:
+     if body.get('functions', []):
+         raise InvalidRequestError(message="functions is not supported.", param='functions')
+ 
+@@ -148,6 +148,13 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
+         generate_params['max_new_tokens'] = 512
+         generate_params['auto_max_new_tokens'] = True
+ 
++    # Recovery limits apply after presets and auto-token defaults.
++    ceiling = body.get('_generation_output_ceiling')
++    if ceiling is not None:
++        generate_params['max_new_tokens'] = (ceiling if generate_params['auto_max_new_tokens']
++                                              else min(generate_params['max_new_tokens'], ceiling))
++        generate_params['auto_max_new_tokens'] = False
++
+     requested_model = generate_params.pop('model')
+     logprob_proc = generate_params.pop('logprob_proc', None)
+     if logprob_proc:
+@@ -243,9 +250,9 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
+                     tool_calls = tool_call
+                     state = GenerationState.GENERATING_TOOL_CALL
+ 
+-            # Single-call mode can release the backend immediately. Parallel
+-            # mode must let the model finish the rest of its call batch.
+-            if tool_calls and not parallel_calls:
++            # Recovery must validate the full turn, including single-call
++            # policy violations, before releasing any executable calls.
++            if tool_calls and not parallel_calls and '_generation_attempt' not in body:
+                 break
+ 
+             if stream:
+@@ -296,6 +303,12 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
+             generator.close()
+ 
+     response_metrics = generate_params.get('_responses_metrics', {})
++    attempt_detail = body.get('_generation_attempt')
++    if attempt_detail is not None:
++        from .generation_recovery import malformed_output
++        attempt_detail.update(raw=answer, cancelled=shared.stop_everything,
++                              error=malformed_output(answer, tool_calls, supported_tools or [], _tool_parsers, parse_tool_call))
++
+     if tool_calls and parallel_calls:
+         # Qwen's outer tag delimits each call. A valid first call must not
+         # hide a malformed or unfinished later member of the batch.
+@@ -357,6 +370,9 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
+         'completion_tokens': completion_token_count,
+         'total_tokens': token_count + completion_token_count,
+     }
++    if attempt_detail is not None:
++        attempt_detail['output_budget'] = (max(0, generate_params['truncation_length'] - token_count)
++                                           if generate_params['auto_max_new_tokens'] else generate_params['max_new_tokens'])
+     if 'cached_tokens' in response_metrics:
+         token_usage['prompt_tokens_details'] = {'cached_tokens': response_metrics['cached_tokens']}
+ 
+@@ -399,5 +415,13 @@ def stream(body: dict, is_legacy: bool = False, stream=False, prompt_only=False,
+         batch.events.extend([DoneEvent(stop_reason), UsageEvent(token_usage)])
+         yield batch
+ 
++def stream(body: dict, is_legacy=False, stream=False, prompt_only=False, stop_event=None):
++    if body.get('tools') and body.get('tool_choice') != 'none' and not prompt_only:
++        from .generation_recovery import recover
++        yield from recover(_stream_once, body, is_legacy=is_legacy, stream=stream, stop_event=stop_event)
++    else:
++        yield from _stream_once(body, is_legacy=is_legacy, stream=stream, prompt_only=prompt_only, stop_event=stop_event)
++
++
+ def collect(body, stop_event=None):
+     return list(stream(body, stream=False, stop_event=stop_event))
+diff --git a/modules/api/generation_recovery.py b/modules/api/generation_recovery.py
+new file mode 100644
+index 0000000..a07ed00
+--- /dev/null
++++ b/modules/api/generation_recovery.py
+@@ -0,0 +1,168 @@
++"""Bounded, pre-delivery recovery for client-executed tool turns.
++
++No HTTP recursion, tool execution, or persistent synthetic conversation state.
++Tool-enabled turns are staged so a rejected attempt can never be executed.
++"""
++import copy
++import json
++import logging
++import os
++import re
++
++from .canonical_items import from_chat_messages
++from .generation_events import DoneEvent, ToolCallDelta, TextDelta, UsageEvent
++from .responses_tools import ToolOutputError, strict_validator
++from modules.reasoning import extract_reasoning
++from modules.tool_parsing import TOOL_CALL_OPENING_MARKERS
++
++
++logger = logging.getLogger(__name__)
++
++def malformed_output(answer, calls, names, parsers, parse):
++    """Check attempted calls before the generation layer hides their markup."""
++    _, content = extract_reasoning(answer)
++    # Examples in Markdown are not evidence of an attempted action.
++    visible = re.sub(r'```.*?(?:```|$)|`[^`\n]*`', '', content, flags=re.S)
++    if '<tool_call>' in visible:
++        blocks = visible.split('<tool_call>')[1:]
++        if any('</tool_call>' not in block or
++               not parse('<tool_call>' + block, names, parsers=parsers)
++               for block in blocks):
++            return 'An attempted tool-call batch contains an invalid or unfinished call.'
++    if not calls and (any(marker in visible for marker in TOOL_CALL_OPENING_MARKERS)
++                      or any(re.search(r'\b' + re.escape(name) + r'\s*\{', visible) for name in names)):
++        return 'Attempted tool output could not be parsed as a declared tool call.'
++    return None
++
++
++def progress_only(text):
++    """Conservative early-EOS heuristic, not a general task-completion judge."""
++    text = text.strip()
++    if not text or len(text) > 600 or any(c in text for c in ('?', '？', '`', '\n')):
++        return False
++    if re.search(r"\b(cannot|can't|unable|blocked|need your|please provide)\b|无法|不能|需要你", text, re.I):
++        return False
++    # Require a short first-person action promise, not a factual final answer.
++    return bool(re.fullmatch(
++        r"(?:(?:Okay|OK|Sure)[,.!]?\s*)?(?:I(?:'ll| will| am going to)|Let me) "
++        r"(?:(?:now|next|continue to) )?(?:check|inspect|search|fetch|process|implement|"
++        r"fix|run|test|create|update|continue|complete|work on)\b[^.!?]*(?:[.!])?",
++        text, re.I) or re.fullmatch(
++        r'(?:好的[，,。]?\s*)?(?:我(?:会|将|现在|接下来)|接下来我(?:会|将)?)'
++        r'(?:继续|检查|查询|搜索|处理|实现|修复|运行|测试|创建|更新|完成)[^。！？]*(?:。)?', text))
++
++
++def _validate_calls(body, calls):
++    if not body.get('_responses_parallel_tool_calls', body.get('parallel_tool_calls', True)) and len(calls) > 1:
++        raise ToolOutputError('Generate at most one tool call in this response.')
++    if '_responses_tool_validation' in body:
++        from types import SimpleNamespace
++        from .responses import output_calls
++        output_calls(SimpleNamespace(**body['_responses_tool_validation']), calls)
++        return
++    validator = body.get('_validate_generation_calls')
++    if validator:
++        validator(calls)
++        return
++    # Chat Completions supplies nested function definitions.
++    definitions = {t['function']['name']: t['function'] for t in body.get('tools', []) if 'function' in t}
++    for call in calls:
++        definition = definitions.get(call['name'])
++        if definition is None:
++            raise ToolOutputError('Generated an undeclared tool.')
++        if definition.get('strict'):
++            try:
++                strict_validator(definition).validate(json.loads(call['arguments']))
++            except Exception as exc:
++                raise ToolOutputError('Generated arguments do not match the strict schema.') from exc
++
++
++def recover(source, body, *, is_legacy=False, stream=False, stop_event=None):
++    """Consume attempts privately; expose only an accepted turn and total usage."""
++    max_repairs = max(0, min(2, int(os.environ.get('TEXTGEN_TOOL_REPAIR_ATTEMPTS', '2'))))
++    detect_progress = os.environ.get('TEXTGEN_REPAIR_PROGRESS', '1').lower() not in ('0', 'false', 'off')
++    original_items = body['items']
++    attempt_body = dict(body)
++    total = dict(prompt_tokens=0, completion_tokens=0, total_tokens=0)
++    cached_tokens = 0
++    fingerprints = set()
++    budget = body.get('length' if is_legacy else 'max_tokens')
++    for attempt in range(max_repairs + 1):
++        if stop_event is not None and stop_event.is_set():
++            return
++        metrics = attempt_body.get('_responses_metrics')
++        if metrics is not None:
++            metrics.clear()
++        detail = {}
++        attempt_body['_generation_attempt'] = detail
++        if budget is not None:
++            attempt_body['_generation_output_ceiling'] = budget - total['completion_tokens']
++        generator = source(attempt_body, is_legacy=is_legacy, stream=stream, stop_event=stop_event)
++        try:
++            batches = list(generator)
++        finally:
++            generator.close()
++        if stop_event is not None and stop_event.is_set():
++            return
++        if detail.get('cancelled'):
++            return
++        events = [event for batch in batches for event in batch.events]
++        usage = next((e.usage for e in events if isinstance(e, UsageEvent)), None)
++        if usage is None:
++            raise ToolOutputError('Generation ended without usage; refusing an unbounded retry.')
++        for key in total:
++            total[key] += usage.get(key, 0)
++        cached_tokens += usage.get('prompt_tokens_details', {}).get('cached_tokens', 0)
++        if budget is None:
++            budget = detail.get('output_budget', usage['completion_tokens'])
++        calls = [dict(id=e.call_id, name=e.name, arguments=e.arguments_delta)
++                 for e in events if isinstance(e, ToolCallDelta)]
++        finish = next((e for e in events if isinstance(e, DoneEvent)), None)
++        if finish is None:
++            raise ToolOutputError('Generation ended without a terminal event.')
++        error = detail.get('error')
++        if not error and calls:
++            try:
++                _validate_calls(body, calls)
++            except ToolOutputError as exc:
++                error = str(exc)
++        text = ''.join(e.text for e in events if isinstance(e, TextDelta))
++        if not error and not calls and detect_progress and progress_only(text):
++            error = 'The response only promises future work without performing it.'
++        if not error and not calls and not text.strip():
++            error = 'The response contains no visible answer or executable tool call.'
++        exhausted = finish.finish_reason == 'length' or (error is not None and total['completion_tokens'] >= budget)
++        if error and not exhausted:
++            fingerprint = (error, detail.get('raw', text).strip())
++            if attempt >= max_repairs or fingerprint in fingerprints:
++                raise ToolOutputError(f'Generation repair exhausted after {attempt} repair attempt(s): {error}')
++            fingerprints.add(fingerprint)
++            logger.info('Server generation repair attempt=%d remaining_output_tokens=%d reason=%s',
++                        attempt + 1, budget - total['completion_tokens'], error)
++            # Only the current rejected attempt is retained. Neither it nor
++            # this correction enters the public response store.
++            correction = (
++                'The previous response was not delivered and no tools from it were executed. '
++                + error + ' Correct the response now using the original task and actual tool results. '
++                'If more work remains, issue valid calls to the available tools in the native tool format. '
++                'Regenerate the entire intended call batch; do not repeat a promise to act. '
++                'Do not invent tool results or missing arguments. If genuinely blocked, explain the blocker '
++                'or ask the necessary question. If the task is already done, give the concrete final result.')
++            attempt_body['items'] = list(original_items) + from_chat_messages([
++                {'role': 'assistant', 'content': detail.get('raw', text)},
++                {'role': 'user', 'content': correction}])
++            continue
++        # A truncated batch is never executable, even if its first call parsed.
++        if exhausted:
++            finish.finish_reason = 'length'
++            for batch in batches:
++                batch.events = [e for e in batch.events if not isinstance(e, ToolCallDelta)]
++        final_usage = dict(total)
++        if cached_tokens:
++            final_usage['prompt_tokens_details'] = {'cached_tokens': cached_tokens}
++        for batch in batches:
++            for event in batch.events:
++                if isinstance(event, UsageEvent):
++                    event.usage = copy.deepcopy(final_usage)
++            yield batch
++        return
+diff --git a/modules/api/responses.py b/modules/api/responses.py
+index 224174f..f376e4b 100644
+--- a/modules/api/responses.py
++++ b/modules/api/responses.py
+@@ -461,9 +461,7 @@ def prepare(request, store=STORE):
+     history.extend(canonical_input_items(request.input, history))
+     if request.instructions is not None:
+         messages.insert(0, {'role': 'system', 'content': request.instructions})
+-    if tools and request.tool_choice != 'none' and not request.parallel_tool_calls:
+-        messages.insert(0, {'role': 'system', 'content': 'Call at most one tool per response. Wait for its result before calling another tool.'})
+-    elif tools and request.tool_choice != 'none':
++    if tools and request.tool_choice != 'none':
+         # Codex/WorkBuddy expects a complete task, not an intermediate plan.
+         # Local models otherwise often stop after the first search and return
+         # a progress note even though the user asked for repeated tool work.
+@@ -481,6 +479,8 @@ def prepare(request, store=STORE):
+             'other available tools to check it first. After tools return, cite '
+             'their concrete result and complete the requested deliverable. '
+             'Only provide the final answer after all requested items are done.')})
++    if tools and request.tool_choice != 'none' and not request.parallel_tool_calls:
++        messages.insert(0, {'role': 'system', 'content': 'Call at most one tool per response. Wait for its result before calling another tool.'})
+     verbosity = (request.text or {}).get('verbosity')
+     if verbosity in ('low', 'high'):
+         messages.insert(0, {'role': 'system', 'content': (
+@@ -556,6 +556,9 @@ def prepare(request, store=STORE):
+     converted['_responses_preserve_items'] = True
+     converted['_responses_parallel_tool_calls'] = request.parallel_tool_calls
+     converted['_responses_metrics'] = GenerationMetrics()
++    if tools:
++        converted['_responses_tool_validation'] = dict(tools=request.tools, tool_choice=request.tool_choice,
++                                                       parallel_tool_calls=request.parallel_tool_calls)
+     if output_grammar is not None:
+         converted['_responses_output_grammar'] = output_grammar
+         logger.info('Responses structured output enabled: loader=ExLlamav3 format=json_schema')
+diff --git a/tests/test_generation_recovery.py b/tests/test_generation_recovery.py
+new file mode 100644
+index 0000000..02efab2
+--- /dev/null
++++ b/tests/test_generation_recovery.py
+@@ -0,0 +1,141 @@
++"""GPU-free tests of the actual pre-delivery recovery coordinator."""
++import copy
++import os
++import threading
++import unittest
++from unittest.mock import patch
++
++from modules.api.canonical_items import from_chat_messages
++from modules.api.generation_events import EventBatch, TextDelta, ToolCallDelta, DoneEvent, UsageEvent
++from modules.api.generation_recovery import recover, malformed_output, progress_only
++from modules.api.responses_tools import ToolOutputError
++from modules.tool_parsing import parse_tool_call
++
++CALL = '<tool_call>{"name":"fetch","arguments":{}}</tool_call>'
++
++
++class RecoveryTests(unittest.TestCase):
++    def setUp(self):
++        self.env = patch.dict(os.environ, TEXTGEN_TOOL_REPAIR_ATTEMPTS='2', TEXTGEN_REPAIR_PROGRESS='1')
++        self.env.start()
++        self.addCleanup(self.env.stop)
++        self.body = {'items': from_chat_messages([{'role': 'user', 'content': 'Fetch both pages.'}]),
++                     'tools': [{'type': 'function', 'function': {'name': 'fetch'}}]}
++        self.seen = []
++        self.closed = []
++
++    def source(self, candidates, budget=100, cancel=None):
++        def generate(body, **kwargs):
++            index = len(self.seen)
++            self.seen.append(copy.deepcopy(body))
++            candidate = candidates[index]
++            body['_generation_attempt'].update(raw=candidate.get('raw', candidate.get('text', '')),
++                error=candidate.get('error'), output_budget=budget)
++            try:
++                events = [TextDelta(candidate.get('text', ''))]
++                if candidate.get('call'):
++                    events.append(ToolCallDelta('call_' + str(index), 'fetch', candidate.get('arguments', '{}')))
++                events.extend([DoneEvent(candidate.get('finish', 'tool_calls' if candidate.get('call') else 'stop')),
++                               UsageEvent({'prompt_tokens': 10, 'completion_tokens': candidate.get('tokens', 5),
++                                           'total_tokens': 10 + candidate.get('tokens', 5)})])
++                yield EventBatch(events)
++                if cancel:
++                    cancel.set()
++            finally:
++                self.closed.append(index)
++        return generate
++
++    def events(self, source, **kwargs):
++        return [e for b in recover(source, self.body, **kwargs) for e in b.events]
++
++    def test_bad_call_repaired_without_leaking_and_usage_aggregated(self):
++        before = copy.deepcopy(self.body)
++        events = self.events(self.source([{'raw': '<tool_call>{', 'text': 'Fetching:', 'error': 'bad'}, {'call': True}]))
++        self.assertEqual([e.call_id for e in events if isinstance(e, ToolCallDelta)], ['call_1'])
++        self.assertNotIn('Fetching:', ''.join(e.text for e in events if isinstance(e, TextDelta)))
++        usage = next(e.usage for e in events if isinstance(e, UsageEvent))
++        self.assertEqual(usage, {'prompt_tokens': 20, 'completion_tokens': 10, 'total_tokens': 30})
++        self.assertEqual(self.seen[1]['_generation_output_ceiling'], 95)
++        self.assertEqual(self.body, before)
++        self.assertEqual(self.closed, [0, 1])
++
++    def test_progress_only_repaired(self):
++        events = self.events(self.source([{'text': 'I will now process the remaining batches.'}, {'call': True}]))
++        self.assertTrue(any(isinstance(e, ToolCallDelta) for e in events))
++        self.assertEqual(len(self.seen), 2)
++
++    def test_complete_answer_not_retried(self):
++        self.events(self.source([{'text': 'Both pages have been fetched.'}]))
++        self.assertEqual(len(self.seen), 1)
++
++    def test_blocker_not_retried(self):
++        self.events(self.source([{'text': 'I cannot access the file. Please provide it.'}]))
++        self.assertEqual(len(self.seen), 1)
++
++    def test_repeat_stops_early(self):
++        with self.assertRaisesRegex(ToolOutputError, 'after 1 repair'):
++            self.events(self.source([{'raw': 'x', 'error': 'bad'}] * 2))
++        self.assertEqual(self.closed, [0, 1])
++
++    def test_attempt_cap(self):
++        with self.assertRaisesRegex(ToolOutputError, 'after 2 repair'):
++            self.events(self.source([{'raw': str(i), 'error': 'bad'} for i in range(3)]))
++        self.assertEqual(len(self.seen), 3)
++
++    def test_exhausted_budget_never_retries_or_delivers_calls(self):
++        events = self.events(self.source([{'call': True, 'error': 'bad', 'tokens': 10}], budget=10))
++        self.assertFalse(any(isinstance(e, ToolCallDelta) for e in events))
++        self.assertEqual(next(e.finish_reason for e in events if isinstance(e, DoneEvent)), 'length')
++        self.assertEqual(len(self.seen), 1)
++
++    def test_backend_length_never_retries(self):
++        events = self.events(self.source([{'error': 'bad', 'finish': 'length'}]))
++        self.assertEqual(len(self.seen), 1)
++        self.assertEqual(next(e.finish_reason for e in events if isinstance(e, DoneEvent)), 'length')
++
++    def test_cancel_before_attempt(self):
++        stop = threading.Event(); stop.set()
++        self.assertEqual(self.events(self.source([]), stop_event=stop), [])
++        self.assertEqual(self.seen, [])
++
++    def test_cancel_during_attempt(self):
++        stop = threading.Event()
++        self.assertEqual(self.events(self.source([{'error': 'bad'}], cancel=stop), stop_event=stop), [])
++        self.assertEqual(self.closed, [0])
++
++    def test_schema_error_repaired_before_delivery(self):
++        def validate(calls):
++            if calls[0]['arguments'] != '{"ok":true}':
++                raise ToolOutputError('schema mismatch')
++        self.body['_validate_generation_calls'] = validate
++        events = self.events(self.source([{'call': True}, {'call': True, 'arguments': '{"ok":true}'}]))
++        self.assertEqual([e.arguments_delta for e in events if isinstance(e, ToolCallDelta)], ['{"ok":true}'])
++
++    def test_zero_attempt_setting_fails_honestly(self):
++        with patch.dict(os.environ, TEXTGEN_TOOL_REPAIR_ATTEMPTS='0'):
++            with self.assertRaises(ToolOutputError):
++                self.events(self.source([{'error': 'bad'}]))
++        self.assertEqual(len(self.seen), 1)
++
++    def test_partial_parallel_batch_detected(self):
++        raw = CALL + '\n<tool_call>{'
++        self.assertIsNotNone(malformed_output(raw, parse_tool_call(raw, ['fetch']), ['fetch'], None, parse_tool_call))
++
++    def test_unknown_tool_detected(self):
++        raw = CALL.replace('fetch', 'missing')
++        self.assertIsNotNone(malformed_output(raw, [], ['fetch'], None, parse_tool_call))
++
++    def test_reasoning_and_markdown_examples_not_errors(self):
++        for raw in ['<think>' + CALL + '</think>Done.', 'Example: `<tool_call>{`', '```xml\n<tool_call>{\n```']:
++            self.assertIsNone(malformed_output(raw, [], ['fetch'], None, parse_tool_call))
++
++    def test_progress_detector_is_conservative(self):
++        for text in ['I will now check the remaining files.', 'Let me search the documentation.', '我会继续处理剩余项目。']:
++            self.assertTrue(progress_only(text), text)
++        for text in ['I will need your password.', 'I cannot continue.', 'Should I continue?', 'All 12 items are complete.',
++                     'Example: "I will check the file."', 'I will check it. The answer is 42.']:
++            self.assertFalse(progress_only(text), text)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_generation_tool_streaming.py b/tests/test_generation_tool_streaming.py
+index a6413dc..74062fb 100644
+--- a/tests/test_generation_tool_streaming.py
++++ b/tests/test_generation_tool_streaming.py
+@@ -13,18 +13,19 @@ SECOND_CALL = '<tool_call>{"name":"fetch","arguments":{"url":"two"}}</tool_call>
+ 
+ 
+ class GenerationToolStreamingTests(unittest.TestCase):
+-    def run_response(self, chunks, *, stream=True, finish='stop'):
++    def run_response(self, chunks, *, stream=True, finish='stop', repairs=None, **request_options):
+         request = responses.ResponsesRequest(
+             input='Fetch the articles', store=False, stream=stream,
+             tools=[{'type': 'function', 'name': 'fetch'}],
+-            max_output_tokens=1000)
++            max_output_tokens=1000, **request_options)
+         body, history = responses.prepare(request)
+         closed = []
++        attempts = [chunks] + (repairs or [])
+ 
+         def backend(*args, **kwargs):
+             body['_responses_metrics'].update(prompt_tokens=100, completion_tokens=20)
+             try:
+-                for text in chunks:
++                for text in attempts[min(len(closed), len(attempts) - 1)]:
+                     yield {'internal': [['Fetch the articles', text]]}
+                 body['_responses_metrics']['finish_reason'] = finish
+             finally:
+@@ -36,7 +37,7 @@ class GenerationToolStreamingTests(unittest.TestCase):
+             for batch in generation.stream(body, stream=stream):
+                 events.extend(converter.process(batch))
+         events.extend(converter.finish())
+-        self.assertEqual(closed, [True])
++        self.assertEqual(closed, [True] * len(attempts))
+         return converter.response, [json.loads(event['data']) for event in events]
+ 
+     @staticmethod
+@@ -82,14 +83,62 @@ class GenerationToolStreamingTests(unittest.TestCase):
+         response, _ = self.run_response(['Value <'])
+         self.assertEqual(self.text(response), 'Value <')
+ 
+-    def test_malformed_or_unknown_call_falls_back_to_visible_prose(self):
++    def test_malformed_or_unknown_call_fails_after_bounded_repair(self):
+         for text in ('Fetching: <tool_call>{',
+                      'Fetching: <tool_call>{"name":"missing","arguments":{}}</tool_call>',
+                      CALL + '\n<tool_call>{'):
+             for streaming in (True, False):
+                 with self.subTest(text=text, stream=streaming):
+-                    response, _ = self.run_response([text], stream=streaming)
+-                    self.assertFalse(any(item['type'] == 'function_call' for item in response['output']))
++                    with self.assertRaises(responses.ToolOutputError):
++                        self.run_response([text], stream=streaming)
++
++    def test_repair_replaces_failed_turn_in_both_modes(self):
++        for streaming in (True, False):
++            response, events = self.run_response(['Fetching: <tool_call>{'], stream=streaming,
++                                                  repairs=[[CALL]])
++            calls = [item for item in response['output'] if item['type'] == 'function_call']
++            self.assertEqual(len(calls), 1)
++            self.assertNotIn('Fetching:', self.text(response))
++            self.assertEqual(response['usage']['output_tokens'], 40)
++            self.assertEqual(events[-1]['type'], 'response.completed')
++
++    def test_server_continues_progress_reply_without_client_changes(self):
++        response, _ = self.run_response(['I will now fetch the remaining articles.'], repairs=[[CALL]])
++        self.assertEqual(len([i for i in response['output'] if i['type'] == 'function_call']), 1)
++
++    def test_single_call_mode_repairs_parallel_batch(self):
++        response, _ = self.run_response([CALL + SECOND_CALL], repairs=[[CALL]], parallel_tool_calls=False)
++        self.assertEqual(len([i for i in response['output'] if i['type'] == 'function_call']), 1)
++
++    def test_strict_schema_is_repaired_before_tool_delivery(self):
++        request = responses.ResponsesRequest(input='Fetch', store=False,
++            tools=[{'type': 'function', 'name': 'fetch', 'strict': True,
++                    'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}},
++                                   'required': ['url'], 'additionalProperties': False}}], max_output_tokens=100)
++        for streaming in (True, False):
++            body, history = responses.prepare(request)
++            limits = []
++            def backend(user_input, state, **kwargs):
++                limits.append(state['max_new_tokens'])
++                state['_responses_metrics'].update(prompt_tokens=10, completion_tokens=20, finish_reason='stop')
++                raw = CALL.replace('"one"', '42') if len(limits) == 1 else CALL
++                yield {'internal': [[user_input, raw]]}
++            converter = responses.StreamConverter(request, history, 'test')
++            with patch.object(generation, 'generate_chat_reply', side_effect=backend):
++                for batch in generation.stream(body, stream=streaming):
++                    converter.process(batch)
++            converter.finish()
++            self.assertEqual(limits, [100, 80])
++            calls = [i for i in converter.response['output'] if i['type'] == 'function_call']
++            self.assertEqual([json.loads(i['arguments']) for i in calls], [{'url': 'one'}])
++            self.assertEqual(converter.response['usage']['output_tokens'], 40)
++
++    def test_single_tool_instruction_also_includes_task_persistence(self):
++        body, _ = responses.prepare(responses.ResponsesRequest(input='Fetch',
++            tools=[{'type': 'function', 'name': 'fetch'}], parallel_tool_calls=False))
++        messages = ' '.join(m['content'] for m in body['messages'] if m['role'] == 'system')
++        self.assertIn('at most one tool', messages)
++        self.assertIn('Continue working', messages)
+ 
+     def test_token_limit_remains_incomplete_and_hides_partial_call(self):
+         for streaming in (True, False):
+@@ -120,7 +169,7 @@ class GenerationToolRouteTests(unittest.IsolatedAsyncioTestCase):
+         for streaming in (True, False):
+             for output, reason, expected in (
+                 (CALL + SECOND_CALL, 'stop', 'tool_calls'),
+-                ('Fetching: <tool_call>{', 'stop', 'stop'),
++                ('Fetching: <tool_call>{', 'stop', 'error'),
+                 ('Fetching: <tool_call>{', 'length', 'length'),
+             ):
+                 with self.subTest(stream=streaming, expected=expected):
+@@ -157,11 +206,45 @@ class GenerationToolRouteTests(unittest.IsolatedAsyncioTestCase):
+                                 self.assertEqual(len(choice['delta']['tool_calls']), 2)
+                     elif expected == 'error':
+                         self.assertEqual(result.status_code, 500)
+-                        self.assertIn('unrecognized tool call', result.json()['error']['message'])
++                        self.assertIn('repair exhausted', result.json()['error']['message'])
+                     else:
+                         self.assertEqual(result.status_code, 200, result.text)
+                         self.assertEqual(result.json()['choices'][0]['finish_reason'], expected)
+ 
++    async def test_http_repair_is_one_response_and_does_not_pollute_stored_history(self):
++        import httpx
++        from modules.api import script
++        for streaming in (True, False):
++            attempts = []
++            def backend(user_input, state, **kwargs):
++                attempts.append(user_input)
++                state['_responses_metrics'].update(prompt_tokens=100, completion_tokens=20, finish_reason='stop')
++                yield {'internal': [[user_input, 'Fetching: <tool_call>{' if len(attempts) == 1 else CALL]]}
++            with patch.object(generation, 'generate_chat_reply', side_effect=backend), \
++                    patch.object(script.shared.args, 'api_key', ''), \
++                    patch('sse_starlette.sse.AppStatus.should_exit_event', None):
++                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=script.app),
++                                             base_url='http://127.0.0.1') as client:
++                    result = await client.post('/v1/responses', json={
++                        'input': 'Fetch', 'tools': [{'type': 'function', 'name': 'fetch'}],
++                        'stream': streaming, 'store': True})
++            self.assertEqual(result.status_code, 200, result.text)
++            if streaming:
++                events = [json.loads(line[6:]) for line in result.text.splitlines() if line.startswith('data: ')]
++                terminals = [e for e in events if e['type'] in ('response.completed', 'response.failed', 'response.incomplete')]
++                self.assertEqual(len(terminals), 1)
++                response = terminals[0]['response']
++            else:
++                response = result.json()
++            self.assertEqual(response['status'], 'completed')
++            self.assertEqual(len(attempts), 2)
++            self.assertEqual(response['usage']['output_tokens'], 40)
++            self.assertEqual(len([i for i in response['output'] if i['type'] == 'function_call']), 1)
++            history = responses.STORE.get(response['id'], field='history')
++            self.assertNotIn('Fetching:', json.dumps(history))
++            self.assertNotIn('previous response was not delivered', json.dumps(history))
++            responses.STORE.delete(response['id'])
++
+     async def test_http_terminal_events_for_parallel_invalid_and_limited_output(self):
+         import httpx
+         from modules.api import script
+diff --git a/tests/test_responses_api.py b/tests/test_responses_api.py
+index e8d3836..3f77535 100644
+--- a/tests/test_responses_api.py
++++ b/tests/test_responses_api.py
+@@ -327,7 +327,8 @@ class ResponsesTests(unittest.TestCase):
+             body['_responses_metrics'].update(prompt_tokens=12, completion_tokens=4)
+             try:
+                 yield {'internal': [['Read', 'tool markup']]}
+-                raise AssertionError('Should stop on the recognized call')
++                # Recovery validates the full batch before releasing a call.
++                body['_responses_metrics']['finish_reason'] = 'stop'
+             finally:
+                 closed.set()
+         with patch.object(script.OAIcompletions, 'generate_chat_reply', side_effect=backend), \
+@@ -336,7 +337,8 @@ class ResponsesTests(unittest.TestCase):
+             generator = script.OAIcompletions.stream_chat_completions(body)
+             try:
+                 next(generator)  # Initial role chunk.
+-                final = next(generator)
++                final = next(chunk for chunk in generator
++                             if chunk.get('choices') and chunk['choices'][0]['finish_reason'])
+                 self.assertEqual(final['choices'][0]['finish_reason'], 'tool_calls')
+                 self.assertTrue(closed.is_set())
+             finally:

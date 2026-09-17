@@ -13,18 +13,19 @@ SECOND_CALL = '<tool_call>{"name":"fetch","arguments":{"url":"two"}}</tool_call>
 
 
 class GenerationToolStreamingTests(unittest.TestCase):
-    def run_response(self, chunks, *, stream=True, finish='stop'):
+    def run_response(self, chunks, *, stream=True, finish='stop', repairs=None, **request_options):
         request = responses.ResponsesRequest(
             input='Fetch the articles', store=False, stream=stream,
             tools=[{'type': 'function', 'name': 'fetch'}],
-            max_output_tokens=1000)
+            max_output_tokens=1000, **request_options)
         body, history = responses.prepare(request)
         closed = []
+        attempts = [chunks] + (repairs or [])
 
         def backend(*args, **kwargs):
             body['_responses_metrics'].update(prompt_tokens=100, completion_tokens=20)
             try:
-                for text in chunks:
+                for text in attempts[min(len(closed), len(attempts) - 1)]:
                     yield {'internal': [['Fetch the articles', text]]}
                 body['_responses_metrics']['finish_reason'] = finish
             finally:
@@ -36,7 +37,7 @@ class GenerationToolStreamingTests(unittest.TestCase):
             for batch in generation.stream(body, stream=stream):
                 events.extend(converter.process(batch))
         events.extend(converter.finish())
-        self.assertEqual(closed, [True])
+        self.assertEqual(closed, [True] * len(attempts))
         return converter.response, [json.loads(event['data']) for event in events]
 
     @staticmethod
@@ -82,14 +83,62 @@ class GenerationToolStreamingTests(unittest.TestCase):
         response, _ = self.run_response(['Value <'])
         self.assertEqual(self.text(response), 'Value <')
 
-    def test_malformed_or_unknown_call_falls_back_to_visible_prose(self):
+    def test_malformed_or_unknown_call_fails_after_bounded_repair(self):
         for text in ('Fetching: <tool_call>{',
                      'Fetching: <tool_call>{"name":"missing","arguments":{}}</tool_call>',
                      CALL + '\n<tool_call>{'):
             for streaming in (True, False):
                 with self.subTest(text=text, stream=streaming):
-                    response, _ = self.run_response([text], stream=streaming)
-                    self.assertFalse(any(item['type'] == 'function_call' for item in response['output']))
+                    with self.assertRaises(responses.ToolOutputError):
+                        self.run_response([text], stream=streaming)
+
+    def test_repair_replaces_failed_turn_in_both_modes(self):
+        for streaming in (True, False):
+            response, events = self.run_response(['Fetching: <tool_call>{'], stream=streaming,
+                                                  repairs=[[CALL]])
+            calls = [item for item in response['output'] if item['type'] == 'function_call']
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn('Fetching:', self.text(response))
+            self.assertEqual(response['usage']['output_tokens'], 40)
+            self.assertEqual(events[-1]['type'], 'response.completed')
+
+    def test_server_continues_progress_reply_without_client_changes(self):
+        response, _ = self.run_response(['I will now fetch the remaining articles.'], repairs=[[CALL]])
+        self.assertEqual(len([i for i in response['output'] if i['type'] == 'function_call']), 1)
+
+    def test_single_call_mode_repairs_parallel_batch(self):
+        response, _ = self.run_response([CALL + SECOND_CALL], repairs=[[CALL]], parallel_tool_calls=False)
+        self.assertEqual(len([i for i in response['output'] if i['type'] == 'function_call']), 1)
+
+    def test_strict_schema_is_repaired_before_tool_delivery(self):
+        request = responses.ResponsesRequest(input='Fetch', store=False,
+            tools=[{'type': 'function', 'name': 'fetch', 'strict': True,
+                    'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}},
+                                   'required': ['url'], 'additionalProperties': False}}], max_output_tokens=100)
+        for streaming in (True, False):
+            body, history = responses.prepare(request)
+            limits = []
+            def backend(user_input, state, **kwargs):
+                limits.append(state['max_new_tokens'])
+                state['_responses_metrics'].update(prompt_tokens=10, completion_tokens=20, finish_reason='stop')
+                raw = CALL.replace('"one"', '42') if len(limits) == 1 else CALL
+                yield {'internal': [[user_input, raw]]}
+            converter = responses.StreamConverter(request, history, 'test')
+            with patch.object(generation, 'generate_chat_reply', side_effect=backend):
+                for batch in generation.stream(body, stream=streaming):
+                    converter.process(batch)
+            converter.finish()
+            self.assertEqual(limits, [100, 80])
+            calls = [i for i in converter.response['output'] if i['type'] == 'function_call']
+            self.assertEqual([json.loads(i['arguments']) for i in calls], [{'url': 'one'}])
+            self.assertEqual(converter.response['usage']['output_tokens'], 40)
+
+    def test_single_tool_instruction_also_includes_task_persistence(self):
+        body, _ = responses.prepare(responses.ResponsesRequest(input='Fetch',
+            tools=[{'type': 'function', 'name': 'fetch'}], parallel_tool_calls=False))
+        messages = ' '.join(m['content'] for m in body['messages'] if m['role'] == 'system')
+        self.assertIn('at most one tool', messages)
+        self.assertIn('Continue working', messages)
 
     def test_token_limit_remains_incomplete_and_hides_partial_call(self):
         for streaming in (True, False):
@@ -120,7 +169,7 @@ class GenerationToolRouteTests(unittest.IsolatedAsyncioTestCase):
         for streaming in (True, False):
             for output, reason, expected in (
                 (CALL + SECOND_CALL, 'stop', 'tool_calls'),
-                ('Fetching: <tool_call>{', 'stop', 'stop'),
+                ('Fetching: <tool_call>{', 'stop', 'error'),
                 ('Fetching: <tool_call>{', 'length', 'length'),
             ):
                 with self.subTest(stream=streaming, expected=expected):
@@ -157,10 +206,44 @@ class GenerationToolRouteTests(unittest.IsolatedAsyncioTestCase):
                                 self.assertEqual(len(choice['delta']['tool_calls']), 2)
                     elif expected == 'error':
                         self.assertEqual(result.status_code, 500)
-                        self.assertIn('unrecognized tool call', result.json()['error']['message'])
+                        self.assertIn('repair exhausted', result.json()['error']['message'])
                     else:
                         self.assertEqual(result.status_code, 200, result.text)
                         self.assertEqual(result.json()['choices'][0]['finish_reason'], expected)
+
+    async def test_http_repair_is_one_response_and_does_not_pollute_stored_history(self):
+        import httpx
+        from modules.api import script
+        for streaming in (True, False):
+            attempts = []
+            def backend(user_input, state, **kwargs):
+                attempts.append(user_input)
+                state['_responses_metrics'].update(prompt_tokens=100, completion_tokens=20, finish_reason='stop')
+                yield {'internal': [[user_input, 'Fetching: <tool_call>{' if len(attempts) == 1 else CALL]]}
+            with patch.object(generation, 'generate_chat_reply', side_effect=backend), \
+                    patch.object(script.shared.args, 'api_key', ''), \
+                    patch('sse_starlette.sse.AppStatus.should_exit_event', None):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=script.app),
+                                             base_url='http://127.0.0.1') as client:
+                    result = await client.post('/v1/responses', json={
+                        'input': 'Fetch', 'tools': [{'type': 'function', 'name': 'fetch'}],
+                        'stream': streaming, 'store': True})
+            self.assertEqual(result.status_code, 200, result.text)
+            if streaming:
+                events = [json.loads(line[6:]) for line in result.text.splitlines() if line.startswith('data: ')]
+                terminals = [e for e in events if e['type'] in ('response.completed', 'response.failed', 'response.incomplete')]
+                self.assertEqual(len(terminals), 1)
+                response = terminals[0]['response']
+            else:
+                response = result.json()
+            self.assertEqual(response['status'], 'completed')
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(response['usage']['output_tokens'], 40)
+            self.assertEqual(len([i for i in response['output'] if i['type'] == 'function_call']), 1)
+            history = responses.STORE.get(response['id'], field='history')
+            self.assertNotIn('Fetching:', json.dumps(history))
+            self.assertNotIn('previous response was not delivered', json.dumps(history))
+            responses.STORE.delete(response['id'])
 
     async def test_http_terminal_events_for_parallel_invalid_and_limited_output(self):
         import httpx

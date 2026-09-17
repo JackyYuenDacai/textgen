@@ -461,9 +461,7 @@ def prepare(request, store=STORE):
     history.extend(canonical_input_items(request.input, history))
     if request.instructions is not None:
         messages.insert(0, {'role': 'system', 'content': request.instructions})
-    if tools and request.tool_choice != 'none' and not request.parallel_tool_calls:
-        messages.insert(0, {'role': 'system', 'content': 'Call at most one tool per response. Wait for its result before calling another tool.'})
-    elif tools and request.tool_choice != 'none':
+    if tools and request.tool_choice != 'none':
         # Codex/WorkBuddy expects a complete task, not an intermediate plan.
         # Local models otherwise often stop after the first search and return
         # a progress note even though the user asked for repeated tool work.
@@ -481,6 +479,8 @@ def prepare(request, store=STORE):
             'other available tools to check it first. After tools return, cite '
             'their concrete result and complete the requested deliverable. '
             'Only provide the final answer after all requested items are done.')})
+    if tools and request.tool_choice != 'none' and not request.parallel_tool_calls:
+        messages.insert(0, {'role': 'system', 'content': 'Call at most one tool per response. Wait for its result before calling another tool.'})
     verbosity = (request.text or {}).get('verbosity')
     if verbosity in ('low', 'high'):
         messages.insert(0, {'role': 'system', 'content': (
@@ -556,6 +556,9 @@ def prepare(request, store=STORE):
     converted['_responses_preserve_items'] = True
     converted['_responses_parallel_tool_calls'] = request.parallel_tool_calls
     converted['_responses_metrics'] = GenerationMetrics()
+    if tools:
+        converted['_responses_tool_validation'] = dict(tools=request.tools, tool_choice=request.tool_choice,
+                                                       parallel_tool_calls=request.parallel_tool_calls)
     if output_grammar is not None:
         converted['_responses_output_grammar'] = output_grammar
         logger.info('Responses structured output enabled: loader=ExLlamav3 format=json_schema')

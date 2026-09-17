@@ -327,7 +327,8 @@ class ResponsesTests(unittest.TestCase):
             body['_responses_metrics'].update(prompt_tokens=12, completion_tokens=4)
             try:
                 yield {'internal': [['Read', 'tool markup']]}
-                raise AssertionError('Should stop on the recognized call')
+                # Recovery validates the full batch before releasing a call.
+                body['_responses_metrics']['finish_reason'] = 'stop'
             finally:
                 closed.set()
         with patch.object(script.OAIcompletions, 'generate_chat_reply', side_effect=backend), \
@@ -336,7 +337,8 @@ class ResponsesTests(unittest.TestCase):
             generator = script.OAIcompletions.stream_chat_completions(body)
             try:
                 next(generator)  # Initial role chunk.
-                final = next(generator)
+                final = next(chunk for chunk in generator
+                             if chunk.get('choices') and chunk['choices'][0]['finish_reason'])
                 self.assertEqual(final['choices'][0]['finish_reason'], 'tool_calls')
                 self.assertTrue(closed.is_set())
             finally:
