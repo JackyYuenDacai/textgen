@@ -35,11 +35,6 @@ RESPONSES_DEFAULT_OUTPUT_TOKENS = int(
     os.environ.get('TEXTGEN_RESPONSES_DEFAULT_OUTPUT_TOKENS', '131072'))
 
 
-def _validate_structured_response(request):
-    """Structured output applies only to answer-only Responses turns."""
-    return not (request.tools and request.tool_choice != 'none')
-
-
 class ResponsesRequest(GenerationOptions):
     model_config = ConfigDict(extra='forbid')
     input: str | list[dict] = Field(default_factory=list)
@@ -429,13 +424,8 @@ def prepare(request, store=STORE):
 
     history = []
     if output_grammar is not None and tools and request.tool_choice != 'none':
-        # A single grammar cannot safely constrain both native tool markup and
-        # the eventual JSON answer.  Tool-capable clients (notably Codex)
-        # commonly send both fields together, so preserve tool execution and
-        # fall back to ordinary answer text for this turn instead of rejecting
-        # the request before generation starts.
-        logger.warning('Responses json_schema ignored while %d function tools are active; tool protocol takes precedence', len(tools))
-        output_grammar = None
+        invalid('json_schema with active tools is not supported; use tool_choice="none" '
+                'for the structured final answer, or omit text.format during tool turns.', 'text.format')
     if request.previous_response_id:
         history = store.get(request.previous_response_id, field='history')
     # Validate before canonicalizing. Keep the public item types and IDs for
@@ -530,10 +520,10 @@ def prepare(request, store=STORE):
     # text, but that default frequently truncates valid structured documents.
     # Give schema constrained turns enough room unless the caller supplied an
     # explicit ceiling; the grammar still stops as soon as the object closes.
-    effective_max_tokens = request.max_output_tokens or RESPONSES_DEFAULT_OUTPUT_TOKENS
-    if effective_max_tokens is None and output_grammar is not None:
-        effective_max_tokens = RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS
-        logger.info('Responses structured output default max_tokens=%d', effective_max_tokens)
+    effective_max_tokens = request.max_output_tokens
+    if effective_max_tokens is None:
+        effective_max_tokens = (RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS
+                                if output_grammar is not None else RESPONSES_DEFAULT_OUTPUT_TOKENS)
     params.update(messages=messages, model=request.model, max_tokens=effective_max_tokens,
                   stream=request.stream, stream_options={'include_usage': True}, tools=tools,
                   tool_choice=request.tool_choice)
@@ -618,8 +608,7 @@ def from_chat(request, chat, history, store=STORE):
     if message.get('content') or not response['output']:
         response['output'].append(message_item(message.get('content') or '', 'incomplete' if choice['finish_reason'] == 'length' else 'completed'))
     complete_response(response, choice['finish_reason'], chat.get('usage'))
-    if _validate_structured_response(request):
-        validate_output(request, response)
+    validate_output(request, response)
     save_response(request, response, history, store)
     return response
 
@@ -672,21 +661,39 @@ class StreamConverter:
     def start(self):
         return self.created() + self.admitted()
 
-    def add_text(self, text):
+    def add_text(self, text, event_factory=None):
+        emit = event_factory or self.event
         events = []
         if self.message is None:
             self.message = message_item('', 'in_progress')
             self.message_index = len(self.response['output'])
             self.response['output'].append(self.message)
             empty = {**self.message, 'content': []}
-            events.append(self.event('response.output_item.added', output_index=self.message_index, item=empty))
-            events.append(self.event('response.content_part.added', output_index=self.message_index,
-                                     item_id=self.message['id'], content_index=0, part=self.message['content'][0]))
+            events.append(emit('response.output_item.added', output_index=self.message_index, item=empty))
+            events.append(emit('response.content_part.added', output_index=self.message_index,
+                                     item_id=self.message['id'], content_index=0, part=dict(self.message['content'][0])))
         self.message['content'][0]['text'] += text
         if text:
-            events.append(self.event('response.output_text.delta', output_index=self.message_index,
+            events.append(emit('response.output_text.delta', output_index=self.message_index,
                                      item_id=self.message['id'], content_index=0, delta=text, logprobs=[]))
         return events
+
+    def call_item(self, call):
+        """Open the public item in its final type; custom JSON is transport only."""
+        tool = next((tool for tool in function_definitions(self.request.tools)
+                     if tool.get('name') == call['name']), {})
+        item = {'type': 'function_call', 'id': call['item_id'], 'call_id': call['id'],
+                'name': call['name'], 'arguments': '', 'status': 'in_progress'}
+        if tool.get('type') == 'custom':
+            item.update(type='custom_tool_call', input='')
+            item.pop('arguments')
+            item.pop('status')
+        for namespace in self.request.tools:
+            if namespace.get('type') == 'namespace':
+                for nested in namespace['tools']:
+                    if call['name'] == namespace['name'] + '.' + nested['name']:
+                        item.update(namespace=namespace['name'], name=nested['name'])
+        return item
 
     def process(self, chunk):
         # Native generation path: adapt semantic events directly at the
@@ -738,16 +745,14 @@ class StreamConverter:
                                          'name': function.get('name', ''),
                                          'arguments': function.get('arguments', ''),
                                          'output_index': len(self.response['output'])}
-                    item = {'type': 'function_call', 'id': item_id, 'call_id': self.calls[index]['id'],
-                            'name': self.calls[index]['name'], 'arguments': self.calls[index]['arguments'],
-                            'status': 'in_progress'}
+                    item = self.call_item(self.calls[index])
                     self.response['output'].append(item)
                     events.append(self.event('response.output_item.added',
                                              output_index=self.calls[index]['output_index'], item=item))
-                    if item['arguments']:
+                    if item['type'] == 'function_call' and self.calls[index]['arguments']:
                         events.append(self.event('response.function_call_arguments.delta',
                                                  output_index=self.calls[index]['output_index'],
-                                                 item_id=item_id, delta=item['arguments']))
+                                                 item_id=item_id, delta=self.calls[index]['arguments']))
                 assembled = self.calls[index]
                 if call.get('id'):
                     assembled['id'] = call['id']
@@ -758,9 +763,11 @@ class StreamConverter:
                 assembled['name'] += name_delta
                 assembled['arguments'] += argument_delta
                 item = self.response['output'][assembled['output_index']]
-                item['name'] = assembled['name']
-                item['arguments'] = assembled['arguments']
-                if argument_delta:
+                if 'namespace' not in item:
+                    item['name'] = assembled['name']
+                if item['type'] == 'function_call':
+                    item['arguments'] = assembled['arguments']
+                if argument_delta and item['type'] == 'function_call':
                     events.append(self.event('response.function_call_arguments.delta',
                                              output_index=assembled['output_index'],
                                              item_id=assembled['item_id'], delta=argument_delta))
@@ -781,15 +788,15 @@ class StreamConverter:
                     self.calls[index] = {'id': event.call_id, 'item_id': 'fc_' + uuid.uuid4().hex,
                                          'name': event.name, 'arguments': '',
                                          'output_index': len(self.response['output'])}
-                    item = {'type': 'function_call', 'id': self.calls[index]['item_id'],
-                            'call_id': event.call_id, 'name': event.name, 'arguments': '', 'status': 'in_progress'}
+                    item = self.call_item(self.calls[index])
                     self.response['output'].append(item)
                     events.append(self.event('response.output_item.added', output_index=self.calls[index]['output_index'], item=item))
                 call = self.calls[index]
                 call['arguments'] += event.arguments_delta
                 item = self.response['output'][call['output_index']]
-                item['arguments'] = call['arguments']
-                if event.arguments_delta:
+                if item['type'] == 'function_call':
+                    item['arguments'] = call['arguments']
+                if event.arguments_delta and item['type'] == 'function_call':
                     events.append(self.event('response.function_call_arguments.delta', output_index=call['output_index'], item_id=call['item_id'], delta=event.arguments_delta))
             elif isinstance(event, DoneEvent):
                 self.finish_reason = event.finish_reason
@@ -837,51 +844,60 @@ class StreamConverter:
         # Item lifecycle events must arrive in output order; the terminal
         # chunks can finalize items in any order.
         groups = {}
+        opening_events = []
+
+        def terminal_event(kind, **data):
+            # Sequence numbers belong to wire order, not construction order.
+            return kind, data
+
         if self.calls:
             for call, item in converted:
                 index = call.get('output_index', len(self.response['output']) - 1)
                 if item['type'] == 'custom_tool_call':
                     group = [
-                        self.event('response.custom_tool_call_input.delta', output_index=index, item_id=item['id'], delta=item['input']),
-                        self.event('response.custom_tool_call_input.done', output_index=index, item_id=item['id'], input=item['input'])]
+                        terminal_event('response.custom_tool_call_input.delta', output_index=index, item_id=item['id'], delta=item['input']),
+                        terminal_event('response.custom_tool_call_input.done', output_index=index, item_id=item['id'], input=item['input'])]
                 else:
-                    group = [self.event('response.function_call_arguments.done', output_index=index, item_id=item['id'],
+                    group = [terminal_event('response.function_call_arguments.done', output_index=index, item_id=item['id'],
                                         arguments=item['arguments'], name=item['name'])]
-                group.append(self.event('response.output_item.done', output_index=index, item=item))
+                group.append(terminal_event('response.output_item.done', output_index=index, item=item))
                 groups.setdefault(index, []).extend(group)
         elif self.pending_text:
             # Buffered text creates its item now; its open events join the
             # item's group so the stream stays in output order.
-            groups[0] = self.add_text(self.pending_text)
+            opening_events = self.add_text(self.pending_text, terminal_event)
         elif not self.response['output']:
             # Preserve the Responses contract for an empty completion.
-            groups[0] = self.add_text('')
+            opening_events = self.add_text('', terminal_event)
         if self.reasoning is not None:
             part = self.reasoning['content'][0]
             groups.setdefault(self.reasoning_index, []).extend([
-                self.event('response.reasoning_summary_text.done', output_index=self.reasoning_index,
+                terminal_event('response.reasoning_summary_text.done', output_index=self.reasoning_index,
                            item_id=self.reasoning['id'], content_index=0, text=part['text']),
-                self.event('response.content_part.done', output_index=self.reasoning_index,
+                terminal_event('response.content_part.done', output_index=self.reasoning_index,
                            item_id=self.reasoning['id'], content_index=0, part=part),
-                self.event('response.output_item.done', output_index=self.reasoning_index, item=self.reasoning)])
+                terminal_event('response.output_item.done', output_index=self.reasoning_index, item=self.reasoning)])
         if self.message is not None:
             part = self.message['content'][0]
             self.message['status'] = 'incomplete' if self.finish_reason == 'length' else 'completed'
             groups.setdefault(self.message_index, []).extend([
-                self.event('response.output_text.done', output_index=self.message_index,
+                terminal_event('response.output_text.done', output_index=self.message_index,
                            item_id=self.message['id'], content_index=0, text=part['text'], logprobs=[]),
-                self.event('response.content_part.done', output_index=self.message_index,
+                terminal_event('response.content_part.done', output_index=self.message_index,
                            item_id=self.message['id'], content_index=0, part=part),
-                self.event('response.output_item.done', output_index=self.message_index, item=self.message)])
-        events = [event for index in sorted(groups) for event in groups[index]]
+                terminal_event('response.output_item.done', output_index=self.message_index, item=self.message)])
         complete_response(self.response, self.finish_reason, self.token_usage)
-        if _validate_structured_response(self.request):
-            validate_output(self.request, self.response)
+        validate_output(self.request, self.response)
         save_response(self.request, self.response, self.history, self.store)
+        ordered = opening_events + [event for index in sorted(groups) for event in groups[index]]
+        events = [self.event(kind, **data) for kind, data in ordered]
         events.append(self.event('response.' + self.response['status'], response=self.response))
         return events
 
     def failed(self, message, code='server_error'):
         self.response['status'] = 'failed'
         self.response['error'] = {'code': code, 'message': message}
+        if code == 'model_output_invalid':
+            self.response['output'] = [item for item in self.response['output']
+                                       if item['type'] not in ('function_call', 'custom_tool_call')]
         return self.event('response.failed', response=self.response)

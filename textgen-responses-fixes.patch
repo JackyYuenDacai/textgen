@@ -1,0 +1,950 @@
+diff --git a/docs/12 - OpenAI API.md b/docs/12 - OpenAI API.md
+index 66390a10..3aab7538 100644
+--- a/docs/12 - OpenAI API.md	
++++ b/docs/12 - OpenAI API.md	
+@@ -102,6 +102,17 @@ openai-python 3.10.0, `get_final_response()` requires `response.completed`; read
+ the `response.incomplete` or `response.failed` event directly in those cases.
+ Disconnecting cancels the generation and does not save a partial response.
+ 
++Event sequence numbers follow wire order, including turns containing reasoning,
++text, and tool calls. Custom tools retain the `custom_tool_call` item type from
++`response.output_item.added` through `.done`; their JSON transport wrapper is
++not exposed as function-call argument events. The raw custom input is emitted
++after the complete call has passed validation.
++
++Responses timing and status logs remain enabled, but generated text, reasoning,
++and tool arguments are not logged by default. For local debugging, explicitly
++set `TEXTGEN_RESPONSES_LOG_CONTENT=1` before starting the server to capture up to
++20,000 characters per streamed response. These logs can contain sensitive data.
++
+ Responses generation is serialized through a process-local FIFO queue: one
+ request runs at a time, including both streaming and non-streaming requests.
+ Waiting requests use asynchronous tickets rather than occupying inference
+@@ -173,12 +184,26 @@ available backend cache pages, not the response ID or the cache key alone.
+ Keep instructions and tool definitions consistent between tool turns; tool
+ definitions are normalized by the existing prompt renderer, so reordering
+ equivalent tools does not change their rendered order.
+-`truncation="disabled"` (default) rejects oversized input instead of silently
++`truncation="disabled"` rejects oversized input instead of silently
+ discarding its prefix, including when ExLlamaV3 image embeddings exceed the
+-loaded capacity. Explicit `truncation="auto"` uses the existing backend clipping
++loaded capacity. The default `truncation="auto"` uses the existing backend clipping
+ behavior. `max_output_tokens` is an output ceiling; available context and EOS may
+ end generation earlier.
+ 
++`text.format.type="json_schema"` supports constrained decoding with the
++ExLlamav3 loader and `llguidance` from `requirements/responses.txt`. Completed
++answers are also validated against the schema. Schema-constrained answers
++cannot currently be combined with active function/custom tools: such requests
++return HTTP 400 with `param="text.format"` before generation starts. Perform
++tool turns without `text.format`, then request the structured final answer
++with `tool_choice="none"`. The server never silently drops the schema.
++
++When `max_output_tokens` is omitted, schema-constrained turns use
++`TEXTGEN_RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS` (default 32,768), and other
++turns use `TEXTGEN_RESPONSES_DEFAULT_OUTPUT_TOKENS` (default 131,072). An explicit
++`max_output_tokens` overrides either default; the loaded model's context limit
++still applies.
++
+ This is a compatibility subset, not every OpenAI hosted feature:
+ 
+ - Client custom tools are adapted to a JSON `input` string for the local model
+@@ -203,8 +228,9 @@ This is a compatibility subset, not every OpenAI hosted feature:
+ - Assistant input `phase` values `commentary` and `final_answer` are preserved
+   through history conversion; the local backend does not infer new phase labels.
+ - Hosted tools, background jobs, Conversations, WebSockets, response compaction,
+-  uploaded files, structured text JSON schemas, and forced tool selection
+-  are not implemented. Unsupported request fields and
++  uploaded files, and forced tool selection are not implemented. Advertised
++  hosted search/computer tools are omitted from the local generation request.
++  Other unsupported request fields and
+   unsupported tool types return errors.
+ - Local reasoning is exposed as plaintext `reasoning_text`; no encrypted content
+   or summaries are generated. Codex's `include=["reasoning.encrypted_content"]`
+diff --git a/modules/api/responses.py b/modules/api/responses.py
+index f376e4bd..390eb364 100644
+--- a/modules/api/responses.py
++++ b/modules/api/responses.py
+@@ -35,11 +35,6 @@ RESPONSES_DEFAULT_OUTPUT_TOKENS = int(
+     os.environ.get('TEXTGEN_RESPONSES_DEFAULT_OUTPUT_TOKENS', '131072'))
+ 
+ 
+-def _validate_structured_response(request):
+-    """Structured output applies only to answer-only Responses turns."""
+-    return not (request.tools and request.tool_choice != 'none')
+-
+-
+ class ResponsesRequest(GenerationOptions):
+     model_config = ConfigDict(extra='forbid')
+     input: str | list[dict] = Field(default_factory=list)
+@@ -429,13 +424,8 @@ def prepare(request, store=STORE):
+ 
+     history = []
+     if output_grammar is not None and tools and request.tool_choice != 'none':
+-        # A single grammar cannot safely constrain both native tool markup and
+-        # the eventual JSON answer.  Tool-capable clients (notably Codex)
+-        # commonly send both fields together, so preserve tool execution and
+-        # fall back to ordinary answer text for this turn instead of rejecting
+-        # the request before generation starts.
+-        logger.warning('Responses json_schema ignored while %d function tools are active; tool protocol takes precedence', len(tools))
+-        output_grammar = None
++        invalid('json_schema with active tools is not supported; use tool_choice="none" '
++                'for the structured final answer, or omit text.format during tool turns.', 'text.format')
+     if request.previous_response_id:
+         history = store.get(request.previous_response_id, field='history')
+     # Validate before canonicalizing. Keep the public item types and IDs for
+@@ -530,10 +520,10 @@ def prepare(request, store=STORE):
+     # text, but that default frequently truncates valid structured documents.
+     # Give schema constrained turns enough room unless the caller supplied an
+     # explicit ceiling; the grammar still stops as soon as the object closes.
+-    effective_max_tokens = request.max_output_tokens or RESPONSES_DEFAULT_OUTPUT_TOKENS
+-    if effective_max_tokens is None and output_grammar is not None:
+-        effective_max_tokens = RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS
+-        logger.info('Responses structured output default max_tokens=%d', effective_max_tokens)
++    effective_max_tokens = request.max_output_tokens
++    if effective_max_tokens is None:
++        effective_max_tokens = (RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS
++                                if output_grammar is not None else RESPONSES_DEFAULT_OUTPUT_TOKENS)
+     params.update(messages=messages, model=request.model, max_tokens=effective_max_tokens,
+                   stream=request.stream, stream_options={'include_usage': True}, tools=tools,
+                   tool_choice=request.tool_choice)
+@@ -618,8 +608,7 @@ def from_chat(request, chat, history, store=STORE):
+     if message.get('content') or not response['output']:
+         response['output'].append(message_item(message.get('content') or '', 'incomplete' if choice['finish_reason'] == 'length' else 'completed'))
+     complete_response(response, choice['finish_reason'], chat.get('usage'))
+-    if _validate_structured_response(request):
+-        validate_output(request, response)
++    validate_output(request, response)
+     save_response(request, response, history, store)
+     return response
+ 
+@@ -672,22 +661,40 @@ class StreamConverter:
+     def start(self):
+         return self.created() + self.admitted()
+ 
+-    def add_text(self, text):
++    def add_text(self, text, event_factory=None):
++        emit = event_factory or self.event
+         events = []
+         if self.message is None:
+             self.message = message_item('', 'in_progress')
+             self.message_index = len(self.response['output'])
+             self.response['output'].append(self.message)
+             empty = {**self.message, 'content': []}
+-            events.append(self.event('response.output_item.added', output_index=self.message_index, item=empty))
+-            events.append(self.event('response.content_part.added', output_index=self.message_index,
+-                                     item_id=self.message['id'], content_index=0, part=self.message['content'][0]))
++            events.append(emit('response.output_item.added', output_index=self.message_index, item=empty))
++            events.append(emit('response.content_part.added', output_index=self.message_index,
++                                     item_id=self.message['id'], content_index=0, part=dict(self.message['content'][0])))
+         self.message['content'][0]['text'] += text
+         if text:
+-            events.append(self.event('response.output_text.delta', output_index=self.message_index,
++            events.append(emit('response.output_text.delta', output_index=self.message_index,
+                                      item_id=self.message['id'], content_index=0, delta=text, logprobs=[]))
+         return events
+ 
++    def call_item(self, call):
++        """Open the public item in its final type; custom JSON is transport only."""
++        tool = next((tool for tool in function_definitions(self.request.tools)
++                     if tool.get('name') == call['name']), {})
++        item = {'type': 'function_call', 'id': call['item_id'], 'call_id': call['id'],
++                'name': call['name'], 'arguments': '', 'status': 'in_progress'}
++        if tool.get('type') == 'custom':
++            item.update(type='custom_tool_call', input='')
++            item.pop('arguments')
++            item.pop('status')
++        for namespace in self.request.tools:
++            if namespace.get('type') == 'namespace':
++                for nested in namespace['tools']:
++                    if call['name'] == namespace['name'] + '.' + nested['name']:
++                        item.update(namespace=namespace['name'], name=nested['name'])
++        return item
++
+     def process(self, chunk):
+         # Native generation path: adapt semantic events directly at the
+         # Responses boundary. The legacy Chat-chunk branch below remains for
+@@ -738,16 +745,14 @@ class StreamConverter:
+                                          'name': function.get('name', ''),
+                                          'arguments': function.get('arguments', ''),
+                                          'output_index': len(self.response['output'])}
+-                    item = {'type': 'function_call', 'id': item_id, 'call_id': self.calls[index]['id'],
+-                            'name': self.calls[index]['name'], 'arguments': self.calls[index]['arguments'],
+-                            'status': 'in_progress'}
++                    item = self.call_item(self.calls[index])
+                     self.response['output'].append(item)
+                     events.append(self.event('response.output_item.added',
+                                              output_index=self.calls[index]['output_index'], item=item))
+-                    if item['arguments']:
++                    if item['type'] == 'function_call' and self.calls[index]['arguments']:
+                         events.append(self.event('response.function_call_arguments.delta',
+                                                  output_index=self.calls[index]['output_index'],
+-                                                 item_id=item_id, delta=item['arguments']))
++                                                 item_id=item_id, delta=self.calls[index]['arguments']))
+                 assembled = self.calls[index]
+                 if call.get('id'):
+                     assembled['id'] = call['id']
+@@ -758,9 +763,11 @@ class StreamConverter:
+                 assembled['name'] += name_delta
+                 assembled['arguments'] += argument_delta
+                 item = self.response['output'][assembled['output_index']]
+-                item['name'] = assembled['name']
+-                item['arguments'] = assembled['arguments']
+-                if argument_delta:
++                if 'namespace' not in item:
++                    item['name'] = assembled['name']
++                if item['type'] == 'function_call':
++                    item['arguments'] = assembled['arguments']
++                if argument_delta and item['type'] == 'function_call':
+                     events.append(self.event('response.function_call_arguments.delta',
+                                              output_index=assembled['output_index'],
+                                              item_id=assembled['item_id'], delta=argument_delta))
+@@ -781,15 +788,15 @@ class StreamConverter:
+                     self.calls[index] = {'id': event.call_id, 'item_id': 'fc_' + uuid.uuid4().hex,
+                                          'name': event.name, 'arguments': '',
+                                          'output_index': len(self.response['output'])}
+-                    item = {'type': 'function_call', 'id': self.calls[index]['item_id'],
+-                            'call_id': event.call_id, 'name': event.name, 'arguments': '', 'status': 'in_progress'}
++                    item = self.call_item(self.calls[index])
+                     self.response['output'].append(item)
+                     events.append(self.event('response.output_item.added', output_index=self.calls[index]['output_index'], item=item))
+                 call = self.calls[index]
+                 call['arguments'] += event.arguments_delta
+                 item = self.response['output'][call['output_index']]
+-                item['arguments'] = call['arguments']
+-                if event.arguments_delta:
++                if item['type'] == 'function_call':
++                    item['arguments'] = call['arguments']
++                if event.arguments_delta and item['type'] == 'function_call':
+                     events.append(self.event('response.function_call_arguments.delta', output_index=call['output_index'], item_id=call['item_id'], delta=event.arguments_delta))
+             elif isinstance(event, DoneEvent):
+                 self.finish_reason = event.finish_reason
+@@ -837,51 +844,60 @@ class StreamConverter:
+         # Item lifecycle events must arrive in output order; the terminal
+         # chunks can finalize items in any order.
+         groups = {}
++        opening_events = []
++
++        def terminal_event(kind, **data):
++            # Sequence numbers belong to wire order, not construction order.
++            return kind, data
++
+         if self.calls:
+             for call, item in converted:
+                 index = call.get('output_index', len(self.response['output']) - 1)
+                 if item['type'] == 'custom_tool_call':
+                     group = [
+-                        self.event('response.custom_tool_call_input.delta', output_index=index, item_id=item['id'], delta=item['input']),
+-                        self.event('response.custom_tool_call_input.done', output_index=index, item_id=item['id'], input=item['input'])]
++                        terminal_event('response.custom_tool_call_input.delta', output_index=index, item_id=item['id'], delta=item['input']),
++                        terminal_event('response.custom_tool_call_input.done', output_index=index, item_id=item['id'], input=item['input'])]
+                 else:
+-                    group = [self.event('response.function_call_arguments.done', output_index=index, item_id=item['id'],
++                    group = [terminal_event('response.function_call_arguments.done', output_index=index, item_id=item['id'],
+                                         arguments=item['arguments'], name=item['name'])]
+-                group.append(self.event('response.output_item.done', output_index=index, item=item))
++                group.append(terminal_event('response.output_item.done', output_index=index, item=item))
+                 groups.setdefault(index, []).extend(group)
+         elif self.pending_text:
+             # Buffered text creates its item now; its open events join the
+             # item's group so the stream stays in output order.
+-            groups[0] = self.add_text(self.pending_text)
++            opening_events = self.add_text(self.pending_text, terminal_event)
+         elif not self.response['output']:
+             # Preserve the Responses contract for an empty completion.
+-            groups[0] = self.add_text('')
++            opening_events = self.add_text('', terminal_event)
+         if self.reasoning is not None:
+             part = self.reasoning['content'][0]
+             groups.setdefault(self.reasoning_index, []).extend([
+-                self.event('response.reasoning_summary_text.done', output_index=self.reasoning_index,
++                terminal_event('response.reasoning_summary_text.done', output_index=self.reasoning_index,
+                            item_id=self.reasoning['id'], content_index=0, text=part['text']),
+-                self.event('response.content_part.done', output_index=self.reasoning_index,
++                terminal_event('response.content_part.done', output_index=self.reasoning_index,
+                            item_id=self.reasoning['id'], content_index=0, part=part),
+-                self.event('response.output_item.done', output_index=self.reasoning_index, item=self.reasoning)])
++                terminal_event('response.output_item.done', output_index=self.reasoning_index, item=self.reasoning)])
+         if self.message is not None:
+             part = self.message['content'][0]
+             self.message['status'] = 'incomplete' if self.finish_reason == 'length' else 'completed'
+             groups.setdefault(self.message_index, []).extend([
+-                self.event('response.output_text.done', output_index=self.message_index,
++                terminal_event('response.output_text.done', output_index=self.message_index,
+                            item_id=self.message['id'], content_index=0, text=part['text'], logprobs=[]),
+-                self.event('response.content_part.done', output_index=self.message_index,
++                terminal_event('response.content_part.done', output_index=self.message_index,
+                            item_id=self.message['id'], content_index=0, part=part),
+-                self.event('response.output_item.done', output_index=self.message_index, item=self.message)])
+-        events = [event for index in sorted(groups) for event in groups[index]]
++                terminal_event('response.output_item.done', output_index=self.message_index, item=self.message)])
+         complete_response(self.response, self.finish_reason, self.token_usage)
+-        if _validate_structured_response(self.request):
+-            validate_output(self.request, self.response)
++        validate_output(self.request, self.response)
+         save_response(self.request, self.response, self.history, self.store)
++        ordered = opening_events + [event for index in sorted(groups) for event in groups[index]]
++        events = [self.event(kind, **data) for kind, data in ordered]
+         events.append(self.event('response.' + self.response['status'], response=self.response))
+         return events
+ 
+     def failed(self, message, code='server_error'):
+         self.response['status'] = 'failed'
+         self.response['error'] = {'code': code, 'message': message}
++        if code == 'model_output_invalid':
++            self.response['output'] = [item for item in self.response['output']
++                                       if item['type'] not in ('function_call', 'custom_tool_call')]
+         return self.event('response.failed', response=self.response)
+diff --git a/modules/api/script.py b/modules/api/script.py
+index 06c22094..1b8688b1 100644
+--- a/modules/api/script.py
++++ b/modules/api/script.py
+@@ -8,6 +8,7 @@ import time
+ import traceback
+ import uuid
+ from collections import deque
++from contextlib import asynccontextmanager
+ from threading import Thread
+ from typing import Literal
+ 
+@@ -36,6 +37,7 @@ from modules.text_generation import stop_everything_event  # used by /v1/interna
+ 
+ _ACTIVE_RESPONSES = {}
+ _ACTIVE_RESPONSES_LOCK = threading.Lock()
++RESPONSES_LOG_CONTENT = os.environ.get('TEXTGEN_RESPONSES_LOG_CONTENT', '').lower() in ('1', 'true', 'yes')
+ 
+ from .typing import (
+     AnthropicRequest,
+@@ -290,6 +292,23 @@ RESPONSES_GENERATION_IDLE_TIMEOUT = float(os.environ.get('TEXTGEN_RESPONSES_IDLE
+ RESPONSES_STREAM_HEARTBEAT_SECONDS = float(os.environ.get('TEXTGEN_RESPONSES_HEARTBEAT_SECONDS', '10'))
+ 
+ 
++@asynccontextmanager
++async def _responses_generation_lock(stop_event):
++    """Acquire without an orphanable worker; always release owned locks."""
++    lock = shared.generation_lock
++    acquired = False
++    try:
++        while not stop_event.is_set():
++            if lock is None or lock.acquire(blocking=False):
++                acquired = True
++                break
++            await asyncio.sleep(0.05)
++        yield acquired
++    finally:
++        if acquired and lock is not None:
++            lock.release()
++
++
+ async def _responses_chunks(response, stop_event):
+     """Yield backend chunks while enforcing an idle timeout.
+ 
+@@ -377,7 +396,7 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
+ 
+             def capture(event):
+                 nonlocal captured_chars
+-                if captured_chars >= 20000:
++                if not RESPONSES_LOG_CONTENT or captured_chars >= 20000:
+                     return
+                 kind = event.get('event', '')
+                 target = ('text' if kind == 'response.output_text.delta' else
+@@ -422,68 +441,65 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
+                 # Responses is a native protocol endpoint. Always use the
+                 # semantic event generator; legacy Chat Completions adapters
+                 # must never be selected for this route.
+-                # ExLlamaV3 shares mutable native/GPU state with Chat and
+-                # Completions. Acquire the process-wide lock in a worker
+-                # thread so a competing request never blocks the event loop.
+-                generation_lock = shared.generation_lock
+-                if generation_lock is not None:
+-                    await asyncio.to_thread(generation_lock.acquire)
+-                response = NativeGeneration.stream(converted, stream=True, stop_event=stop_event)
+-                logger.info('[responses %s] generation started after %.2fs', request_id, time.perf_counter() - started)
+-                try:
+-                    async for chunk in _responses_chunks(response, stop_event):
+-                        if stop_event.is_set():
+-                            return
+-                        if isinstance(chunk, dict) and chunk.get('__responses_heartbeat__'):
+-                            # SSE comments reset intermediary/client idle
+-                            # timers without changing the Responses event
+-                            # sequence or response state.
+-                            yield {'comment': 'keep-alive'}
+-                            continue
+-                        for event in converter.process(chunk):
+-                            event_kind = event.get('event')
+-                            now = time.perf_counter()
+-                            if event_kind == 'response.output_text.delta' and first_wire_text_at is None:
+-                                first_wire_text_at = now
+-                                logger.info('[responses %s] first text delta after %.2fs',
+-                                            request_id, now - started)
+-                            elif event_kind in ('response.function_call_arguments.delta',
+-                                                'response.custom_tool_call_input.delta') and first_wire_tool_at is None:
+-                                first_wire_tool_at = now
+-                                logger.info('[responses %s] first tool-call delta after %.2fs',
+-                                            request_id, now - started)
+-                            capture(event)
+-                            yield event
+-                    if not stop_event.is_set():
+-                        # Grammar/schema validation and history snapshots can
+-                        # be expensive; keep queue pings and disconnects live.
+-                        terminal_events = await asyncio.to_thread(converter.finish)
+-                        for event in terminal_events:
+-                            if event.get('event') == 'response.completed' and first_wire_completion_at is None:
+-                                first_wire_completion_at = time.perf_counter()
+-                                logger.info('[responses %s] response.completed after %.2fs',
+-                                            request_id, first_wire_completion_at - started)
+-                            yield event
+-                        elapsed = time.perf_counter() - started
+-                        logger.info('[responses %s] stream completed in %.2fs', request_id, elapsed)
+-                        log_captured(converter.response['status'])
+-                except OpenAIError as error:
+-                    log_captured('failed')
+-                    logger.warning('[responses %s] generation OpenAIError after %.2fs: %s', request_id, time.perf_counter() - started, error)
+-                    yield converter.failed(error.message, 'invalid_prompt' if error.code < 500 else 'server_error')
+-                except Responses.ToolOutputError as error:
+-                    log_captured('failed')
+-                    logger.warning('[responses %s] tool output error after %.2fs: %s', request_id, time.perf_counter() - started, error)
+-                    yield converter.failed(str(error), 'model_output_invalid')
+-                except Exception:
+-                    log_captured('failed')
+-                    logger.exception('Responses generation failed')
+-                    yield converter.failed('Local generation failed; check the server log.')
+-                finally:
+-                    stop_event.set()
+-                    response.close()
+-                    if generation_lock is not None:
+-                        generation_lock.release()
++                # A cancelled waiter must never acquire the model lock later.
++                async with _responses_generation_lock(stop_event) as acquired:
++                    if not acquired:
++                        return
++                    converted['_generation_lock_owned'] = shared.generation_lock is not None
++                    response = NativeGeneration.stream(converted, stream=True, stop_event=stop_event)
++                    logger.info('[responses %s] generation started after %.2fs', request_id, time.perf_counter() - started)
++                    try:
++                        async for chunk in _responses_chunks(response, stop_event):
++                            if stop_event.is_set():
++                                return
++                            if isinstance(chunk, dict) and chunk.get('__responses_heartbeat__'):
++                                # SSE comments reset intermediary/client idle
++                                # timers without changing the Responses event
++                                # sequence or response state.
++                                yield {'comment': 'keep-alive'}
++                                continue
++                            for event in converter.process(chunk):
++                                event_kind = event.get('event')
++                                now = time.perf_counter()
++                                if event_kind == 'response.output_text.delta' and first_wire_text_at is None:
++                                    first_wire_text_at = now
++                                    logger.info('[responses %s] first text delta after %.2fs',
++                                                request_id, now - started)
++                                elif event_kind in ('response.function_call_arguments.delta',
++                                                    'response.custom_tool_call_input.delta') and first_wire_tool_at is None:
++                                    first_wire_tool_at = now
++                                    logger.info('[responses %s] first tool-call delta after %.2fs',
++                                                request_id, now - started)
++                                capture(event)
++                                yield event
++                        if not stop_event.is_set():
++                            # Grammar/schema validation and history snapshots can
++                            # be expensive; keep queue pings and disconnects live.
++                            terminal_events = await asyncio.to_thread(converter.finish)
++                            for event in terminal_events:
++                                if event.get('event') == 'response.completed' and first_wire_completion_at is None:
++                                    first_wire_completion_at = time.perf_counter()
++                                    logger.info('[responses %s] response.completed after %.2fs',
++                                                request_id, first_wire_completion_at - started)
++                                yield event
++                            elapsed = time.perf_counter() - started
++                            logger.info('[responses %s] stream completed in %.2fs', request_id, elapsed)
++                            log_captured(converter.response['status'])
++                    except OpenAIError as error:
++                        log_captured('failed')
++                        logger.warning('[responses %s] generation OpenAIError after %.2fs: %s', request_id, time.perf_counter() - started, error)
++                        yield converter.failed(error.message, 'invalid_prompt' if error.code < 500 else 'server_error')
++                    except Responses.ToolOutputError as error:
++                        log_captured('failed')
++                        logger.warning('[responses %s] tool output error after %.2fs: %s', request_id, time.perf_counter() - started, error)
++                        yield converter.failed(str(error), 'model_output_invalid')
++                    except Exception:
++                        log_captured('failed')
++                        logger.exception('Responses generation failed')
++                        yield converter.failed('Local generation failed; check the server log.')
++                    finally:
++                        stop_event.set()
++                        response.close()
+             finally:
+                 with _ACTIVE_RESPONSES_LOCK:
+                     _ACTIVE_RESPONSES.pop(response_id, None)
+@@ -499,8 +515,9 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
+                     generation_lock = shared.generation_lock
+                     if generation_lock is not None:
+                         generation_lock.acquire()
+-                    converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
+                     try:
++                        converted['_generation_lock_owned'] = generation_lock is not None
++                        converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
+                         for batch in NativeGeneration.stream(converted, stream=False, stop_event=stop_event):
+                             converter.process(batch)
+                         converter.finish()
+diff --git a/modules/text_generation.py b/modules/text_generation.py
+index 362c2675..ff18927f 100644
+--- a/modules/text_generation.py
++++ b/modules/text_generation.py
+@@ -29,8 +29,12 @@ def generate_reply(*args, **kwargs):
+         and (shared.model.__class__.__name__ != 'LlamaServer' or shared.args.parallel > 1)
+     )
+ 
+-    if not use_parallel and shared.generation_lock is not None:
+-        shared.generation_lock.acquire()
++    # Responses owns this lock across the complete turn, including retries.
++    # Do not reacquire its non-reentrant lock in a backend worker.
++    generation_lock = shared.generation_lock
++    acquire_lock = not use_parallel and generation_lock is not None and not state.get('_generation_lock_owned', False)
++    if acquire_lock:
++        generation_lock.acquire()
+ 
+     with models._generation_count_lock:
+         models.active_generation_count += 1
+@@ -43,8 +47,8 @@ def generate_reply(*args, **kwargs):
+             models.active_generation_count -= 1
+ 
+         models.last_generation_time = time.time()
+-        if not use_parallel and shared.generation_lock is not None:
+-            shared.generation_lock.release()
++        if acquire_lock:
++            generation_lock.release()
+ 
+ 
+ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escape_html=False, for_ui=False):
+diff --git a/tests/test_responses_api.py b/tests/test_responses_api.py
+index 3f775358..7b84af0a 100644
+--- a/tests/test_responses_api.py
++++ b/tests/test_responses_api.py
+@@ -11,12 +11,26 @@ with patch('sys.argv', ['textgen-tests']):
+     from modules.api.errors import InvalidRequestError
+ 
+ 
++from modules.api.generation_events import EventBatch, TextDelta, ReasoningDelta, ToolCallDelta, DoneEvent, UsageEvent
++
++
+ def chat_result(content='Hello', calls=None, reason='stop'):
+     return {'model': 'loaded-model', 'choices': [{'finish_reason': reason, 'message': {
+         'content': content, **({'tool_calls': calls} if calls else {})}}],
+         'usage': {'prompt_tokens': 10, 'completion_tokens': 3, 'total_tokens': 13}}
+ 
+ 
++def native_result(content='Hello', calls=None, reason='stop'):
++    from modules.api.generation_events import EventBatch, StartedEvent, TextDelta, ToolCallDelta, DoneEvent, UsageEvent
++    events = [StartedEvent('loaded-model')]
++    if content is not None:
++        events.append(TextDelta(content))
++    for index, call in enumerate(calls or []):
++        events.append(ToolCallDelta(call['id'], call['function']['name'], call['function']['arguments'], index))
++    yield EventBatch(events)
++    yield EventBatch([UsageEvent(chat_result()['usage']), DoneEvent(reason)])
++
++
+ def decoded(events):
+     return [json.loads(event['data']) for event in events]
+ 
+@@ -34,7 +48,7 @@ class ResponsesTests(unittest.TestCase):
+         self.assertEqual(body['messages'][0], {'role': 'system', 'content': 'Be brief'})
+         self.assertEqual(body['messages'][1]['content'][1]['type'], 'image_url')
+         self.assertEqual(body['max_tokens'], 25)
+-        self.assertTrue(body['_responses_no_truncation'])
++        self.assertFalse(body['_responses_no_truncation'])
+         self.assertEqual(raw, original)
+         self.assertEqual(len(history), 1)
+ 
+@@ -71,7 +85,7 @@ class ResponsesTests(unittest.TestCase):
+ 
+     def test_rejects_unsupported_and_invalid_inputs(self):
+         options = [dict(background=True), dict(tool_choice='required'),
+-                   dict(text={'format': {'type': 'json_schema'}}), dict(tools=[{'type': 'web_search'}]),
++                   dict(text={'format': {'type': 'json_schema'}}),
+                    dict(input=[{'type': 'function_call_output', 'call_id': 'missing', 'output': 'x'}]),
+                    dict(input=[{'role': 'user', 'content': [{'type': 'input_file', 'file_id': 'file_1'}]}]),
+                    dict(reasoning={'summary': 'invalid'}), dict(input=[{'type': 'reasoning', 'encrypted_content': 'secret'}])]
+@@ -331,7 +345,13 @@ class ResponsesTests(unittest.TestCase):
+                 body['_responses_metrics']['finish_reason'] = 'stop'
+             finally:
+                 closed.set()
+-        with patch.object(script.OAIcompletions, 'generate_chat_reply', side_effect=backend), \
++        # The legacy adapter rebinds native hooks. Restore those bindings too,
++        # so this compatibility test cannot leak its fake parser into others.
++        with patch.multiple(script.NativeGeneration,
++                            generate_chat_reply=script.NativeGeneration.generate_chat_reply,
++                            parse_tool_call=script.NativeGeneration.parse_tool_call,
++                            get_tool_call_id=script.NativeGeneration.get_tool_call_id), \
++                patch.object(script.OAIcompletions, 'generate_chat_reply', side_effect=backend), \
+                 patch.object(script.OAIcompletions, 'parse_tool_call', return_value=[
+                     {'type': 'function', 'function': {'name': 'f', 'arguments': {}}}]):
+             generator = script.OAIcompletions.stream_chat_completions(body)
+@@ -532,7 +552,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
+         entered, stopping, release = threading.Event(), threading.Event(), threading.Event()
+         second_entered = threading.Event()
+         calls = []
+-        def backend(body, *, stop_event):
++        def backend(body, *, stop_event, **kwargs):
+             calls.append(body['messages'][-1]['content'])
+             if len(calls) == 1:
+                 entered.set()
+@@ -541,13 +561,13 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
+                 if not release.wait(3): raise TimeoutError('cleanup not released')
+             else:
+                 second_entered.set()
+-            return chat_result()
++            yield from native_result()
+         async def receive():
+             await asyncio.Event().wait()
+         request = SimpleNamespace(receive=receive)
+         first = second = None
+         with patch.object(api, 'GENERATION_QUEUE', api.GenerationQueue()), \
+-                patch.object(script.OAIcompletions, 'chat_completions', side_effect=backend):
++                patch.object(script.NativeGeneration, 'stream', side_effect=backend):
+             try:
+                 first = asyncio.create_task(script.openai_responses(request, api.ResponsesRequest(input='first', store=False)))
+                 self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+@@ -569,9 +589,9 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
+     async def test_http_stream_failure_never_completed_or_stored(self):
+         import httpx
+         def backend(*args, **kwargs):
+-            yield {'choices': [{'delta': {'content': 'Partial'}}]}
++            yield EventBatch([TextDelta('Partial')])
+             raise InvalidRequestError('Context overflow', 'input')
+-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
++        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
+                 patch.object(script.shared.args, 'api_key', ''), patch.object(api.STORE, 'put') as put, \
+                 patch('sse_starlette.sse.AppStatus.should_exit_event', None):
+             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=script.app), base_url='http://127.0.0.1') as client:
+@@ -592,13 +612,13 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
+             bodies.append(args[0])
+             if len(bodies) == 1:
+                 tc = {'index': 0, 'id': 'call_1', 'function': {'name': 'add', 'arguments': '{"a": 1}'}}
+-                yield {'choices': [{'delta': {'tool_calls': [tc]}, 'finish_reason': 'tool_calls'}]}
+-                yield {'choices': [], 'usage': {'prompt_tokens': 5, 'completion_tokens': 2, 'total_tokens': 7}}
++                yield EventBatch([ToolCallDelta('call_1', 'add', '{"a": 1}'), DoneEvent('tool_calls')])
++                yield EventBatch([UsageEvent({'prompt_tokens': 5, 'completion_tokens': 2, 'total_tokens': 7})])
+             else:
+-                yield {'choices': [{'delta': {'content': 'The sum is 2.'}}]}
+-                yield {'choices': [{'delta': {}, 'finish_reason': 'stop'}]}
+-                yield {'choices': [], 'usage': {'prompt_tokens': 9, 'completion_tokens': 5, 'total_tokens': 14}}
+-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
++                yield EventBatch([TextDelta('The sum is 2.')])
++                yield EventBatch([DoneEvent('stop')])
++                yield EventBatch([UsageEvent({'prompt_tokens': 9, 'completion_tokens': 5, 'total_tokens': 14})])
++        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
+                 patch.object(script.shared.args, 'api_key', ''), \
+                 patch('sse_starlette.sse.AppStatus.should_exit_event', None):
+             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=script.app), base_url='http://127.0.0.1') as client:
+@@ -660,11 +680,11 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
+             entered.set()
+             try:
+                 if not stop_event.wait(3):
+-                    yield {'choices': []}
++                    yield EventBatch([])
+             finally:
+                 finished.set()
+         request = SimpleNamespace()
+-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
++        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
+                 patch('sse_starlette.sse.AppStatus.should_exit_event', None), patch.object(api.STORE, 'put') as put:
+             result = await script.openai_responses(request, api.ResponsesRequest(input='Hi', stream=True))
+             async def receive():
+@@ -683,7 +703,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
+     async def test_http_shapes_auth_validation_and_storage(self):
+         import httpx
+         transport = httpx.ASGITransport(app=script.app)
+-        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result()), \
++        with patch.object(script.NativeGeneration, 'stream', side_effect=lambda *a, **k: native_result()), \
+                 patch.object(script.shared.args, 'api_key', 'test-secret'):
+             async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1') as client:
+                 response = await client.post('/v1/responses', json={'input': 'Hi'})
+diff --git a/tests/test_responses_regressions.py b/tests/test_responses_regressions.py
+new file mode 100644
+index 00000000..28593166
+--- /dev/null
++++ b/tests/test_responses_regressions.py
+@@ -0,0 +1,173 @@
++"""Responses wire contracts and cancellation regressions; no model required."""
++import asyncio
++import json
++import threading
++import unittest
++from unittest.mock import Mock, patch
++
++from test_responses_api import api, script, decoded
++from modules.api.generation_events import EventBatch, ReasoningDelta, TextDelta, ToolCallDelta, DoneEvent
++
++
++FORMAT = {'format': {'type': 'json_schema', 'name': 'answer', 'strict': True,
++                     'schema': {'type': 'object', 'properties': {'ok': {'type': 'boolean'}},
++                                'required': ['ok'], 'additionalProperties': False}}}
++
++
++class WireTests(unittest.TestCase):
++    def test_buffered_text_opens_with_empty_content_before_its_delta(self):
++        request = api.ResponsesRequest(input='Hi', store=False, tools=[{'type': 'function', 'name': 'lookup'}])
++        converter = api.StreamConverter(request, [], 'local')
++        events = converter.start() + converter.process({'choices': [
++            {'delta': {'content': 'Hello'}, 'finish_reason': 'stop'}]}) + converter.finish()
++        data = decoded(events)
++        part = next(e['part'] for e in data if e['type'] == 'response.content_part.added')
++        self.assertEqual(part['text'], '')
++        self.assertEqual(''.join(e['delta'] for e in data if e['type'] == 'response.output_text.delta'), 'Hello')
++        self.assertEqual([e['sequence_number'] for e in data], list(range(len(data))))
++
++    def test_mixed_native_events_have_contiguous_wire_sequence(self):
++        request = api.ResponsesRequest(input='Hi', store=False,
++                                       tools=[{'type': 'function', 'name': 'lookup'}])
++        converter = api.StreamConverter(request, [], 'local')
++        events = converter.start()
++        for event in [ReasoningDelta('Think'), TextDelta('Checking'),
++                      ToolCallDelta('call_1', 'lookup', '{}'), DoneEvent('tool_calls')]:
++            events += converter.process(EventBatch([event]))
++        events += converter.finish()
++        data = decoded(events)
++        self.assertEqual([e['sequence_number'] for e in data], list(range(len(data))))
++        self.assertEqual([e['output_index'] for e in data if e['type'] == 'response.output_item.done'], [0, 1, 2])
++
++    def test_custom_tool_type_and_namespace_stay_stable(self):
++        request = api.ResponsesRequest(input='Patch', store=False, tools=[
++            {'type': 'namespace', 'name': 'editor', 'tools': [{'type': 'custom', 'name': 'apply_patch'}]}])
++        converter = api.StreamConverter(request, [], 'local')
++        raw = 'line one\nline two ☃'
++        transport = json.dumps({'input': raw})
++        events = converter.start()
++        for fragment in [transport[:12], transport[12:]]:
++            events += converter.process(EventBatch([ToolCallDelta('call_1', 'editor.apply_patch', fragment)]))
++        events += converter.process(EventBatch([DoneEvent('tool_calls')]))
++        events += converter.finish()
++        data = decoded(events)
++        items = [e['item'] for e in data if e['type'] in ('response.output_item.added', 'response.output_item.done')]
++        self.assertEqual([item['type'] for item in items], ['custom_tool_call'] * 2)
++        self.assertEqual(items[0]['id'], items[1]['id'])
++        self.assertTrue(all(item['namespace'] == 'editor' and item['name'] == 'apply_patch' for item in items))
++        self.assertFalse(any('function_call_arguments' in e['type'] for e in data))
++        self.assertEqual(''.join(e['delta'] for e in data if e['type'] == 'response.custom_tool_call_input.delta'), raw)
++        self.assertEqual(items[1]['input'], raw)
++
++    def test_structured_output_defaults_and_explicit_limit(self):
++        with patch.object(script.shared.args, 'loader', 'ExLlamav3'):
++            for explicit, expected in [(None, api.RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS), (99, 99)]:
++                request = api.ResponsesRequest(input='JSON', text=FORMAT, max_output_tokens=explicit, store=False)
++                body, _ = api.prepare(request)
++                self.assertEqual(body['max_tokens'], expected)
++                self.assertIsNotNone(body['_responses_output_grammar'])
++            body, _ = api.prepare(api.ResponsesRequest(input='Hello'))
++            self.assertEqual(body['max_tokens'], api.RESPONSES_DEFAULT_OUTPUT_TOKENS)
++
++    def test_structured_output_rejects_active_tools_and_validates_answer(self):
++        tools = [{'type': 'function', 'name': 'lookup'}]
++        with patch.object(script.shared.args, 'loader', 'ExLlamav3'):
++            with self.assertRaisesRegex(api.InvalidRequestError, 'active tools'):
++                api.prepare(api.ResponsesRequest(input='JSON', text=FORMAT, tools=tools))
++            request = api.ResponsesRequest(input='JSON', text=FORMAT, tools=tools, tool_choice='none', store=False)
++            api.prepare(request)
++            converter = api.StreamConverter(request, [], 'local')
++            events = converter.start() + converter.process(EventBatch([TextDelta('{"ok":"wrong"}'), DoneEvent('stop')]))
++            from modules.api.responses_format import StructuredOutputError
++            with self.assertRaises(StructuredOutputError):
++                converter.finish()
++            events.append(converter.failed('Invalid output'))
++            data = decoded(events)
++            self.assertEqual([e['sequence_number'] for e in data], list(range(len(data))))
++            self.assertFalse(any(e['type'] == 'response.completed' for e in data))
++
++    def test_owned_generation_lock_is_not_acquired_or_released_twice(self):
++        from modules import text_generation
++        lock = Mock()
++        lock.acquire.side_effect = AssertionError('Nested lock acquisition')
++        with patch.object(script.shared, 'generation_lock', lock), \
++                patch.object(text_generation.models, 'load_model_if_idle_unloaded'), \
++                patch.object(text_generation, '_generate_reply', return_value=iter(['Hello'])):
++            self.assertEqual(list(text_generation.generate_reply('Hi', {'_generation_lock_owned': True})), ['Hello'])
++        lock.acquire.assert_not_called()
++        lock.release.assert_not_called()
++
++
++class RouteRegressions(unittest.IsolatedAsyncioTestCase):
++    async def test_cancelled_lock_waiter_never_acquires_later(self):
++        lock = threading.Lock()
++        lock.acquire()
++        started = asyncio.Event()
++        async def waiter():
++            started.set()
++            async with script._responses_generation_lock(threading.Event()):
++                self.fail('Cancelled waiter entered generation')
++        with patch.object(script.shared, 'generation_lock', lock):
++            task = asyncio.create_task(waiter())
++            await started.wait()
++            task.cancel()
++            with self.assertRaises(asyncio.CancelledError):
++                await task
++            lock.release()
++            # There is no detached acquisition worker left to steal the lock.
++            await asyncio.sleep(0.1)
++            self.assertTrue(lock.acquire(blocking=False))
++            lock.release()
++
++    async def test_owned_lock_released_on_cancellation_and_error(self):
++        lock = threading.Lock()
++        entered = asyncio.Event()
++        async def owner():
++            async with script._responses_generation_lock(threading.Event()) as acquired:
++                self.assertTrue(acquired)
++                entered.set()
++                await asyncio.Event().wait()
++        with patch.object(script.shared, 'generation_lock', lock):
++            task = asyncio.create_task(owner())
++            await entered.wait()
++            task.cancel()
++            with self.assertRaises(asyncio.CancelledError):
++                await task
++            self.assertFalse(lock.locked())
++            with self.assertRaisesRegex(RuntimeError, 'backend failure'):
++                async with script._responses_generation_lock(threading.Event()):
++                    raise RuntimeError('backend failure')
++            self.assertFalse(lock.locked())
++
++    async def test_schema_tools_rejected_before_generation_over_http(self):
++        import httpx
++        with patch.object(script.shared.args, 'loader', 'ExLlamav3'), \
++                patch.object(script.shared.args, 'api_key', ''), \
++                patch.object(script.NativeGeneration, 'stream') as backend:
++            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=script.app), base_url='http://127.0.0.1') as client:
++                for stream in [False, True]:
++                    response = await client.post('/v1/responses', json={'input': 'JSON', 'text': FORMAT,
++                        'tools': [{'type': 'function', 'name': 'lookup'}], 'stream': stream})
++                    self.assertEqual(response.status_code, 400)
++                    self.assertEqual(response.json()['error']['param'], 'text.format')
++            backend.assert_not_called()
++
++    async def test_content_logging_requires_opt_in(self):
++        import httpx
++        def backend(*args, **kwargs):
++            yield EventBatch([ReasoningDelta('PRIVATE_REASONING'), TextDelta('PRIVATE_ANSWER'),
++                              ToolCallDelta('call_1', 'lookup', '{"value":"PRIVATE_ARGUMENT"}'), DoneEvent('tool_calls')])
++        for enabled in [False, True]:
++            with self.subTest(enabled=enabled), patch.object(script, 'RESPONSES_LOG_CONTENT', enabled), \
++                    patch.object(script.logger, 'info') as log, \
++                    patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
++                    patch.object(script.shared.args, 'api_key', ''), \
++                    patch('sse_starlette.sse.AppStatus.should_exit_event', None):
++                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=script.app), base_url='http://127.0.0.1') as client:
++                    response = await client.post('/v1/responses', json={'input': 'Hi', 'stream': True, 'store': False,
++                        'tools': [{'type': 'function', 'name': 'lookup'}]})
++                self.assertIn('response.completed', response.text)
++                logged = str(log.call_args_list)
++                for value in ['PRIVATE_REASONING', 'PRIVATE_ANSWER', 'PRIVATE_ARGUMENT']:
++                    self.assertEqual(value in logged, enabled)
++                self.assertIn('stream completed', logged)
+diff --git a/tests/test_responses_sdk.py b/tests/test_responses_sdk.py
+index f5355132..b9b1df3e 100644
+--- a/tests/test_responses_sdk.py
++++ b/tests/test_responses_sdk.py
+@@ -15,7 +15,9 @@ else:
+     from openai import _base_client
+     httpx = getattr(_base_client, 'httpx2', None) or _base_client.httpx
+ 
+-from test_responses_api import api, script, chat_result
++from modules.api.generation_events import EventBatch, TextDelta, ReasoningDelta, ToolCallDelta, DoneEvent, UsageEvent
++
++from test_responses_api import api, script, chat_result, native_result
+ 
+ 
+ @unittest.skipIf(openai is None, 'Optional openai SDK is not installed')
+@@ -32,11 +34,11 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
+ 
+     async def test_sdk_create_tool_result_retrieve_delete(self):
+         calls = [{'id': 'call_1', 'function': {'name': 'weather', 'arguments': '{"city":"HK"}'}}]
+-        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result(None, calls, 'tool_calls')):
++        with patch.object(script.NativeGeneration, 'stream', side_effect=lambda *a, **k: native_result(None, calls, 'tool_calls')):
+             first = await self.client.responses.create(model='local', input='Weather',
+                 tools=[{'type': 'function', 'name': 'weather', 'strict': False}])
+         self.assertEqual(first.output[0].call_id, 'call_1')
+-        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result('Sunny')) as backend:
++        with patch.object(script.NativeGeneration, 'stream', side_effect=lambda *a, **k: native_result('Sunny')) as backend:
+             result = await self.client.responses.create(model='local', previous_response_id=first.id,
+                 input=[{'type': 'function_call_output', 'call_id': first.output[0].call_id, 'output': 'Sunny'}])
+         self.assertEqual(result.output_text, 'Sunny')
+@@ -49,11 +51,11 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
+ 
+     async def test_sdk_stream_accumulates_reasoning_and_text(self):
+         def backend(*args, **kwargs):
+-            yield {'choices': [{'delta': {'reasoning_content': 'Think'}}]}
+-            yield {'choices': [{'delta': {'content': 'Hel'}}]}
+-            yield {'choices': [{'delta': {'content': 'lo'}, 'finish_reason': 'stop'}]}
+-            yield {'choices': [], 'usage': chat_result()['usage']}
+-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
++            yield EventBatch([ReasoningDelta('Think')])
++            yield EventBatch([TextDelta('Hel')])
++            yield EventBatch([TextDelta('lo'), DoneEvent('stop')])
++            yield EventBatch([UsageEvent(chat_result()['usage'])])
++        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
+                 patch('sse_starlette.sse.AppStatus.should_exit_event', None):
+             async with self.client.responses.stream(model='local', input='Hi', store=False) as stream:
+                 events = [event async for event in stream]
+@@ -68,10 +70,8 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
+         raw = '*** Begin Patch\n*** Add File: result.txt\n+hello\n*** End Patch'
+         tool = {'type': 'custom', 'name': 'apply_patch', 'format': {'type': 'text'}}
+         def backend(*args, **kwargs):
+-            yield {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'patch_1',
+-                'function': {'name': 'apply_patch', 'arguments': json.dumps({'input': raw})}}]},
+-                'finish_reason': 'tool_calls'}]}
+-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
++            yield EventBatch([ToolCallDelta('patch_1', 'apply_patch', json.dumps({'input': raw})), DoneEvent('tool_calls')])
++        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
+                 patch('sse_starlette.sse.AppStatus.should_exit_event', None):
+             async with self.client.responses.stream(model='local', input='Create result.txt',
+                     tools=[tool], parallel_tool_calls=False, store=False) as stream:
+@@ -79,8 +79,13 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
+                 result = await stream.get_final_response()
+         self.assertEqual(result.output[0].type, 'custom_tool_call')
+         self.assertEqual(result.output[0].input, raw)
++        opened = next(e.item for e in events if e.type == 'response.output_item.added')
++        self.assertEqual(opened.type, 'custom_tool_call')
++        self.assertEqual(opened.id, result.output[0].id)
++        self.assertFalse(any('function_call_arguments' in e.type for e in events))
++        self.assertEqual([e.sequence_number for e in events], list(range(len(events))))
+         self.assertIn('response.custom_tool_call_input.done', [e.type for e in events])
+-        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result('Done')) as backend:
++        with patch.object(script.NativeGeneration, 'stream', side_effect=lambda *a, **k: native_result('Done')) as backend:
+             follow = await self.client.responses.create(model='local', store=False, tools=[tool], input=[
+                 {'role': 'user', 'content': 'Create result.txt'}, result.output[0].model_dump(exclude_none=True),
+                 {'type': 'custom_tool_call_output', 'call_id': 'patch_1', 'output': 'Success'}])
+@@ -92,13 +97,13 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
+         tool = {'type': 'function', 'name': 'read', 'strict': True, 'parameters': {
+             'type': 'object', 'properties': {'id': {'type': 'integer'}}, 'required': ['id']}}
+         calls = [{'id': 'bad', 'function': {'name': 'read', 'arguments': '{"id":"wrong"}'}}]
+-        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result(None, calls, 'tool_calls')):
++        with patch.object(script.NativeGeneration, 'stream', side_effect=lambda *a, **k: native_result(None, calls, 'tool_calls')):
+             # Disable SDK retries for this deterministic invalid model result.
+             with self.assertRaisesRegex(openai.InternalServerError, 'strict schema validation'):
+                 await self.client.with_options(max_retries=0).responses.create(model='local', input='Read', tools=[tool])
+         def backend(*args, **kwargs):
+-            yield {'choices': [{'delta': {'tool_calls': [{'index': 0, **calls[0]}]}, 'finish_reason': 'tool_calls'}]}
+-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
++            yield from native_result(None, calls, 'tool_calls')
++        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
+                 patch('sse_starlette.sse.AppStatus.should_exit_event', None):
+             stream = await self.client.responses.create(model='local', input='Read', tools=[tool], stream=True)
+             events = [event async for event in stream]
+@@ -113,12 +118,11 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
+             def backend(*args, **kwargs):
+                 if finish_reason == 'tool_calls':
+                     for index in range(2):
+-                        yield {'choices': [{'delta': {'tool_calls': [{'index': index, 'id': f'call_{index}',
+-                            'function': {'name': 'lookup', 'arguments': json.dumps({'index': index})}}]}}]}
++                        yield EventBatch([ToolCallDelta(f'call_{index}', 'lookup', json.dumps({'index': index}), index)])
+                 else:
+-                    yield {'choices': [{'delta': {'content': 'Cut short'}}]}
+-                yield {'choices': [{'delta': {}, 'finish_reason': finish_reason}]}
+-            with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
++                    yield EventBatch([TextDelta('Cut short')])
++                yield EventBatch([DoneEvent(finish_reason)])
++            with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
+                     patch('sse_starlette.sse.AppStatus.should_exit_event', None):
+                 async with self.client.responses.stream(model='local', input='Hi', store=False,
+                         tools=[{'type': 'function', 'name': 'lookup', 'strict': False}]) as stream:

@@ -8,6 +8,7 @@ import time
 import traceback
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from threading import Thread
 from typing import Literal
 
@@ -36,6 +37,7 @@ from modules.text_generation import stop_everything_event  # used by /v1/interna
 
 _ACTIVE_RESPONSES = {}
 _ACTIVE_RESPONSES_LOCK = threading.Lock()
+RESPONSES_LOG_CONTENT = os.environ.get('TEXTGEN_RESPONSES_LOG_CONTENT', '').lower() in ('1', 'true', 'yes')
 
 from .typing import (
     AnthropicRequest,
@@ -290,6 +292,23 @@ RESPONSES_GENERATION_IDLE_TIMEOUT = float(os.environ.get('TEXTGEN_RESPONSES_IDLE
 RESPONSES_STREAM_HEARTBEAT_SECONDS = float(os.environ.get('TEXTGEN_RESPONSES_HEARTBEAT_SECONDS', '10'))
 
 
+@asynccontextmanager
+async def _responses_generation_lock(stop_event):
+    """Acquire without an orphanable worker; always release owned locks."""
+    lock = shared.generation_lock
+    acquired = False
+    try:
+        while not stop_event.is_set():
+            if lock is None or lock.acquire(blocking=False):
+                acquired = True
+                break
+            await asyncio.sleep(0.05)
+        yield acquired
+    finally:
+        if acquired and lock is not None:
+            lock.release()
+
+
 async def _responses_chunks(response, stop_event):
     """Yield backend chunks while enforcing an idle timeout.
 
@@ -377,7 +396,7 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
 
             def capture(event):
                 nonlocal captured_chars
-                if captured_chars >= 20000:
+                if not RESPONSES_LOG_CONTENT or captured_chars >= 20000:
                     return
                 kind = event.get('event', '')
                 target = ('text' if kind == 'response.output_text.delta' else
@@ -422,68 +441,65 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
                 # Responses is a native protocol endpoint. Always use the
                 # semantic event generator; legacy Chat Completions adapters
                 # must never be selected for this route.
-                # ExLlamaV3 shares mutable native/GPU state with Chat and
-                # Completions. Acquire the process-wide lock in a worker
-                # thread so a competing request never blocks the event loop.
-                generation_lock = shared.generation_lock
-                if generation_lock is not None:
-                    await asyncio.to_thread(generation_lock.acquire)
-                response = NativeGeneration.stream(converted, stream=True, stop_event=stop_event)
-                logger.info('[responses %s] generation started after %.2fs', request_id, time.perf_counter() - started)
-                try:
-                    async for chunk in _responses_chunks(response, stop_event):
-                        if stop_event.is_set():
-                            return
-                        if isinstance(chunk, dict) and chunk.get('__responses_heartbeat__'):
-                            # SSE comments reset intermediary/client idle
-                            # timers without changing the Responses event
-                            # sequence or response state.
-                            yield {'comment': 'keep-alive'}
-                            continue
-                        for event in converter.process(chunk):
-                            event_kind = event.get('event')
-                            now = time.perf_counter()
-                            if event_kind == 'response.output_text.delta' and first_wire_text_at is None:
-                                first_wire_text_at = now
-                                logger.info('[responses %s] first text delta after %.2fs',
-                                            request_id, now - started)
-                            elif event_kind in ('response.function_call_arguments.delta',
-                                                'response.custom_tool_call_input.delta') and first_wire_tool_at is None:
-                                first_wire_tool_at = now
-                                logger.info('[responses %s] first tool-call delta after %.2fs',
-                                            request_id, now - started)
-                            capture(event)
-                            yield event
-                    if not stop_event.is_set():
-                        # Grammar/schema validation and history snapshots can
-                        # be expensive; keep queue pings and disconnects live.
-                        terminal_events = await asyncio.to_thread(converter.finish)
-                        for event in terminal_events:
-                            if event.get('event') == 'response.completed' and first_wire_completion_at is None:
-                                first_wire_completion_at = time.perf_counter()
-                                logger.info('[responses %s] response.completed after %.2fs',
-                                            request_id, first_wire_completion_at - started)
-                            yield event
-                        elapsed = time.perf_counter() - started
-                        logger.info('[responses %s] stream completed in %.2fs', request_id, elapsed)
-                        log_captured(converter.response['status'])
-                except OpenAIError as error:
-                    log_captured('failed')
-                    logger.warning('[responses %s] generation OpenAIError after %.2fs: %s', request_id, time.perf_counter() - started, error)
-                    yield converter.failed(error.message, 'invalid_prompt' if error.code < 500 else 'server_error')
-                except Responses.ToolOutputError as error:
-                    log_captured('failed')
-                    logger.warning('[responses %s] tool output error after %.2fs: %s', request_id, time.perf_counter() - started, error)
-                    yield converter.failed(str(error), 'model_output_invalid')
-                except Exception:
-                    log_captured('failed')
-                    logger.exception('Responses generation failed')
-                    yield converter.failed('Local generation failed; check the server log.')
-                finally:
-                    stop_event.set()
-                    response.close()
-                    if generation_lock is not None:
-                        generation_lock.release()
+                # A cancelled waiter must never acquire the model lock later.
+                async with _responses_generation_lock(stop_event) as acquired:
+                    if not acquired:
+                        return
+                    converted['_generation_lock_owned'] = shared.generation_lock is not None
+                    response = NativeGeneration.stream(converted, stream=True, stop_event=stop_event)
+                    logger.info('[responses %s] generation started after %.2fs', request_id, time.perf_counter() - started)
+                    try:
+                        async for chunk in _responses_chunks(response, stop_event):
+                            if stop_event.is_set():
+                                return
+                            if isinstance(chunk, dict) and chunk.get('__responses_heartbeat__'):
+                                # SSE comments reset intermediary/client idle
+                                # timers without changing the Responses event
+                                # sequence or response state.
+                                yield {'comment': 'keep-alive'}
+                                continue
+                            for event in converter.process(chunk):
+                                event_kind = event.get('event')
+                                now = time.perf_counter()
+                                if event_kind == 'response.output_text.delta' and first_wire_text_at is None:
+                                    first_wire_text_at = now
+                                    logger.info('[responses %s] first text delta after %.2fs',
+                                                request_id, now - started)
+                                elif event_kind in ('response.function_call_arguments.delta',
+                                                    'response.custom_tool_call_input.delta') and first_wire_tool_at is None:
+                                    first_wire_tool_at = now
+                                    logger.info('[responses %s] first tool-call delta after %.2fs',
+                                                request_id, now - started)
+                                capture(event)
+                                yield event
+                        if not stop_event.is_set():
+                            # Grammar/schema validation and history snapshots can
+                            # be expensive; keep queue pings and disconnects live.
+                            terminal_events = await asyncio.to_thread(converter.finish)
+                            for event in terminal_events:
+                                if event.get('event') == 'response.completed' and first_wire_completion_at is None:
+                                    first_wire_completion_at = time.perf_counter()
+                                    logger.info('[responses %s] response.completed after %.2fs',
+                                                request_id, first_wire_completion_at - started)
+                                yield event
+                            elapsed = time.perf_counter() - started
+                            logger.info('[responses %s] stream completed in %.2fs', request_id, elapsed)
+                            log_captured(converter.response['status'])
+                    except OpenAIError as error:
+                        log_captured('failed')
+                        logger.warning('[responses %s] generation OpenAIError after %.2fs: %s', request_id, time.perf_counter() - started, error)
+                        yield converter.failed(error.message, 'invalid_prompt' if error.code < 500 else 'server_error')
+                    except Responses.ToolOutputError as error:
+                        log_captured('failed')
+                        logger.warning('[responses %s] tool output error after %.2fs: %s', request_id, time.perf_counter() - started, error)
+                        yield converter.failed(str(error), 'model_output_invalid')
+                    except Exception:
+                        log_captured('failed')
+                        logger.exception('Responses generation failed')
+                        yield converter.failed('Local generation failed; check the server log.')
+                    finally:
+                        stop_event.set()
+                        response.close()
             finally:
                 with _ACTIVE_RESPONSES_LOCK:
                     _ACTIVE_RESPONSES.pop(response_id, None)
@@ -499,8 +515,9 @@ async def openai_responses(request: Request, request_data: Responses.ResponsesRe
                     generation_lock = shared.generation_lock
                     if generation_lock is not None:
                         generation_lock.acquire()
-                    converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
                     try:
+                        converted['_generation_lock_owned'] = generation_lock is not None
+                        converter = Responses.StreamConverter(request_data, history, shared.model_name or 'unknown')
                         for batch in NativeGeneration.stream(converted, stream=False, stop_event=stop_event):
                             converter.process(batch)
                         converter.finish()

@@ -102,6 +102,17 @@ openai-python 3.10.0, `get_final_response()` requires `response.completed`; read
 the `response.incomplete` or `response.failed` event directly in those cases.
 Disconnecting cancels the generation and does not save a partial response.
 
+Event sequence numbers follow wire order, including turns containing reasoning,
+text, and tool calls. Custom tools retain the `custom_tool_call` item type from
+`response.output_item.added` through `.done`; their JSON transport wrapper is
+not exposed as function-call argument events. The raw custom input is emitted
+after the complete call has passed validation.
+
+Responses timing and status logs remain enabled, but generated text, reasoning,
+and tool arguments are not logged by default. For local debugging, explicitly
+set `TEXTGEN_RESPONSES_LOG_CONTENT=1` before starting the server to capture up to
+20,000 characters per streamed response. These logs can contain sensitive data.
+
 Responses generation is serialized through a process-local FIFO queue: one
 request runs at a time, including both streaming and non-streaming requests.
 Waiting requests use asynchronous tickets rather than occupying inference
@@ -173,11 +184,25 @@ available backend cache pages, not the response ID or the cache key alone.
 Keep instructions and tool definitions consistent between tool turns; tool
 definitions are normalized by the existing prompt renderer, so reordering
 equivalent tools does not change their rendered order.
-`truncation="disabled"` (default) rejects oversized input instead of silently
+`truncation="disabled"` rejects oversized input instead of silently
 discarding its prefix, including when ExLlamaV3 image embeddings exceed the
-loaded capacity. Explicit `truncation="auto"` uses the existing backend clipping
+loaded capacity. The default `truncation="auto"` uses the existing backend clipping
 behavior. `max_output_tokens` is an output ceiling; available context and EOS may
 end generation earlier.
+
+`text.format.type="json_schema"` supports constrained decoding with the
+ExLlamav3 loader and `llguidance` from `requirements/responses.txt`. Completed
+answers are also validated against the schema. Schema-constrained answers
+cannot currently be combined with active function/custom tools: such requests
+return HTTP 400 with `param="text.format"` before generation starts. Perform
+tool turns without `text.format`, then request the structured final answer
+with `tool_choice="none"`. The server never silently drops the schema.
+
+When `max_output_tokens` is omitted, schema-constrained turns use
+`TEXTGEN_RESPONSES_DEFAULT_STRUCTURED_OUTPUT_TOKENS` (default 32,768), and other
+turns use `TEXTGEN_RESPONSES_DEFAULT_OUTPUT_TOKENS` (default 131,072). An explicit
+`max_output_tokens` overrides either default; the loaded model's context limit
+still applies.
 
 This is a compatibility subset, not every OpenAI hosted feature:
 
@@ -203,8 +228,9 @@ This is a compatibility subset, not every OpenAI hosted feature:
 - Assistant input `phase` values `commentary` and `final_answer` are preserved
   through history conversion; the local backend does not infer new phase labels.
 - Hosted tools, background jobs, Conversations, WebSockets, response compaction,
-  uploaded files, structured text JSON schemas, and forced tool selection
-  are not implemented. Unsupported request fields and
+  uploaded files, and forced tool selection are not implemented. Advertised
+  hosted search/computer tools are omitted from the local generation request.
+  Other unsupported request fields and
   unsupported tool types return errors.
 - Local reasoning is exposed as plaintext `reasoning_text`; no encrypted content
   or summaries are generated. Codex's `include=["reasoning.encrypted_content"]`

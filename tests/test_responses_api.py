@@ -11,10 +11,24 @@ with patch('sys.argv', ['textgen-tests']):
     from modules.api.errors import InvalidRequestError
 
 
+from modules.api.generation_events import EventBatch, TextDelta, ReasoningDelta, ToolCallDelta, DoneEvent, UsageEvent
+
+
 def chat_result(content='Hello', calls=None, reason='stop'):
     return {'model': 'loaded-model', 'choices': [{'finish_reason': reason, 'message': {
         'content': content, **({'tool_calls': calls} if calls else {})}}],
         'usage': {'prompt_tokens': 10, 'completion_tokens': 3, 'total_tokens': 13}}
+
+
+def native_result(content='Hello', calls=None, reason='stop'):
+    from modules.api.generation_events import EventBatch, StartedEvent, TextDelta, ToolCallDelta, DoneEvent, UsageEvent
+    events = [StartedEvent('loaded-model')]
+    if content is not None:
+        events.append(TextDelta(content))
+    for index, call in enumerate(calls or []):
+        events.append(ToolCallDelta(call['id'], call['function']['name'], call['function']['arguments'], index))
+    yield EventBatch(events)
+    yield EventBatch([UsageEvent(chat_result()['usage']), DoneEvent(reason)])
 
 
 def decoded(events):
@@ -34,7 +48,7 @@ class ResponsesTests(unittest.TestCase):
         self.assertEqual(body['messages'][0], {'role': 'system', 'content': 'Be brief'})
         self.assertEqual(body['messages'][1]['content'][1]['type'], 'image_url')
         self.assertEqual(body['max_tokens'], 25)
-        self.assertTrue(body['_responses_no_truncation'])
+        self.assertFalse(body['_responses_no_truncation'])
         self.assertEqual(raw, original)
         self.assertEqual(len(history), 1)
 
@@ -71,7 +85,7 @@ class ResponsesTests(unittest.TestCase):
 
     def test_rejects_unsupported_and_invalid_inputs(self):
         options = [dict(background=True), dict(tool_choice='required'),
-                   dict(text={'format': {'type': 'json_schema'}}), dict(tools=[{'type': 'web_search'}]),
+                   dict(text={'format': {'type': 'json_schema'}}),
                    dict(input=[{'type': 'function_call_output', 'call_id': 'missing', 'output': 'x'}]),
                    dict(input=[{'role': 'user', 'content': [{'type': 'input_file', 'file_id': 'file_1'}]}]),
                    dict(reasoning={'summary': 'invalid'}), dict(input=[{'type': 'reasoning', 'encrypted_content': 'secret'}])]
@@ -331,7 +345,13 @@ class ResponsesTests(unittest.TestCase):
                 body['_responses_metrics']['finish_reason'] = 'stop'
             finally:
                 closed.set()
-        with patch.object(script.OAIcompletions, 'generate_chat_reply', side_effect=backend), \
+        # The legacy adapter rebinds native hooks. Restore those bindings too,
+        # so this compatibility test cannot leak its fake parser into others.
+        with patch.multiple(script.NativeGeneration,
+                            generate_chat_reply=script.NativeGeneration.generate_chat_reply,
+                            parse_tool_call=script.NativeGeneration.parse_tool_call,
+                            get_tool_call_id=script.NativeGeneration.get_tool_call_id), \
+                patch.object(script.OAIcompletions, 'generate_chat_reply', side_effect=backend), \
                 patch.object(script.OAIcompletions, 'parse_tool_call', return_value=[
                     {'type': 'function', 'function': {'name': 'f', 'arguments': {}}}]):
             generator = script.OAIcompletions.stream_chat_completions(body)
@@ -532,7 +552,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         entered, stopping, release = threading.Event(), threading.Event(), threading.Event()
         second_entered = threading.Event()
         calls = []
-        def backend(body, *, stop_event):
+        def backend(body, *, stop_event, **kwargs):
             calls.append(body['messages'][-1]['content'])
             if len(calls) == 1:
                 entered.set()
@@ -541,13 +561,13 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
                 if not release.wait(3): raise TimeoutError('cleanup not released')
             else:
                 second_entered.set()
-            return chat_result()
+            yield from native_result()
         async def receive():
             await asyncio.Event().wait()
         request = SimpleNamespace(receive=receive)
         first = second = None
         with patch.object(api, 'GENERATION_QUEUE', api.GenerationQueue()), \
-                patch.object(script.OAIcompletions, 'chat_completions', side_effect=backend):
+                patch.object(script.NativeGeneration, 'stream', side_effect=backend):
             try:
                 first = asyncio.create_task(script.openai_responses(request, api.ResponsesRequest(input='first', store=False)))
                 self.assertTrue(await asyncio.to_thread(entered.wait, 2))
@@ -569,9 +589,9 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_stream_failure_never_completed_or_stored(self):
         import httpx
         def backend(*args, **kwargs):
-            yield {'choices': [{'delta': {'content': 'Partial'}}]}
+            yield EventBatch([TextDelta('Partial')])
             raise InvalidRequestError('Context overflow', 'input')
-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
+        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
                 patch.object(script.shared.args, 'api_key', ''), patch.object(api.STORE, 'put') as put, \
                 patch('sse_starlette.sse.AppStatus.should_exit_event', None):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=script.app), base_url='http://127.0.0.1') as client:
@@ -592,13 +612,13 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
             bodies.append(args[0])
             if len(bodies) == 1:
                 tc = {'index': 0, 'id': 'call_1', 'function': {'name': 'add', 'arguments': '{"a": 1}'}}
-                yield {'choices': [{'delta': {'tool_calls': [tc]}, 'finish_reason': 'tool_calls'}]}
-                yield {'choices': [], 'usage': {'prompt_tokens': 5, 'completion_tokens': 2, 'total_tokens': 7}}
+                yield EventBatch([ToolCallDelta('call_1', 'add', '{"a": 1}'), DoneEvent('tool_calls')])
+                yield EventBatch([UsageEvent({'prompt_tokens': 5, 'completion_tokens': 2, 'total_tokens': 7})])
             else:
-                yield {'choices': [{'delta': {'content': 'The sum is 2.'}}]}
-                yield {'choices': [{'delta': {}, 'finish_reason': 'stop'}]}
-                yield {'choices': [], 'usage': {'prompt_tokens': 9, 'completion_tokens': 5, 'total_tokens': 14}}
-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
+                yield EventBatch([TextDelta('The sum is 2.')])
+                yield EventBatch([DoneEvent('stop')])
+                yield EventBatch([UsageEvent({'prompt_tokens': 9, 'completion_tokens': 5, 'total_tokens': 14})])
+        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
                 patch.object(script.shared.args, 'api_key', ''), \
                 patch('sse_starlette.sse.AppStatus.should_exit_event', None):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=script.app), base_url='http://127.0.0.1') as client:
@@ -660,11 +680,11 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             try:
                 if not stop_event.wait(3):
-                    yield {'choices': []}
+                    yield EventBatch([])
             finally:
                 finished.set()
         request = SimpleNamespace()
-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
+        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
                 patch('sse_starlette.sse.AppStatus.should_exit_event', None), patch.object(api.STORE, 'put') as put:
             result = await script.openai_responses(request, api.ResponsesRequest(input='Hi', stream=True))
             async def receive():
@@ -683,7 +703,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_shapes_auth_validation_and_storage(self):
         import httpx
         transport = httpx.ASGITransport(app=script.app)
-        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result()), \
+        with patch.object(script.NativeGeneration, 'stream', side_effect=lambda *a, **k: native_result()), \
                 patch.object(script.shared.args, 'api_key', 'test-secret'):
             async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1') as client:
                 response = await client.post('/v1/responses', json={'input': 'Hi'})

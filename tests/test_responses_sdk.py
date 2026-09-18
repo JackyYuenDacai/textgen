@@ -15,7 +15,9 @@ else:
     from openai import _base_client
     httpx = getattr(_base_client, 'httpx2', None) or _base_client.httpx
 
-from test_responses_api import api, script, chat_result
+from modules.api.generation_events import EventBatch, TextDelta, ReasoningDelta, ToolCallDelta, DoneEvent, UsageEvent
+
+from test_responses_api import api, script, chat_result, native_result
 
 
 @unittest.skipIf(openai is None, 'Optional openai SDK is not installed')
@@ -32,11 +34,11 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sdk_create_tool_result_retrieve_delete(self):
         calls = [{'id': 'call_1', 'function': {'name': 'weather', 'arguments': '{"city":"HK"}'}}]
-        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result(None, calls, 'tool_calls')):
+        with patch.object(script.NativeGeneration, 'stream', side_effect=lambda *a, **k: native_result(None, calls, 'tool_calls')):
             first = await self.client.responses.create(model='local', input='Weather',
                 tools=[{'type': 'function', 'name': 'weather', 'strict': False}])
         self.assertEqual(first.output[0].call_id, 'call_1')
-        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result('Sunny')) as backend:
+        with patch.object(script.NativeGeneration, 'stream', side_effect=lambda *a, **k: native_result('Sunny')) as backend:
             result = await self.client.responses.create(model='local', previous_response_id=first.id,
                 input=[{'type': 'function_call_output', 'call_id': first.output[0].call_id, 'output': 'Sunny'}])
         self.assertEqual(result.output_text, 'Sunny')
@@ -49,11 +51,11 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sdk_stream_accumulates_reasoning_and_text(self):
         def backend(*args, **kwargs):
-            yield {'choices': [{'delta': {'reasoning_content': 'Think'}}]}
-            yield {'choices': [{'delta': {'content': 'Hel'}}]}
-            yield {'choices': [{'delta': {'content': 'lo'}, 'finish_reason': 'stop'}]}
-            yield {'choices': [], 'usage': chat_result()['usage']}
-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
+            yield EventBatch([ReasoningDelta('Think')])
+            yield EventBatch([TextDelta('Hel')])
+            yield EventBatch([TextDelta('lo'), DoneEvent('stop')])
+            yield EventBatch([UsageEvent(chat_result()['usage'])])
+        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
                 patch('sse_starlette.sse.AppStatus.should_exit_event', None):
             async with self.client.responses.stream(model='local', input='Hi', store=False) as stream:
                 events = [event async for event in stream]
@@ -68,10 +70,8 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
         raw = '*** Begin Patch\n*** Add File: result.txt\n+hello\n*** End Patch'
         tool = {'type': 'custom', 'name': 'apply_patch', 'format': {'type': 'text'}}
         def backend(*args, **kwargs):
-            yield {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'patch_1',
-                'function': {'name': 'apply_patch', 'arguments': json.dumps({'input': raw})}}]},
-                'finish_reason': 'tool_calls'}]}
-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
+            yield EventBatch([ToolCallDelta('patch_1', 'apply_patch', json.dumps({'input': raw})), DoneEvent('tool_calls')])
+        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
                 patch('sse_starlette.sse.AppStatus.should_exit_event', None):
             async with self.client.responses.stream(model='local', input='Create result.txt',
                     tools=[tool], parallel_tool_calls=False, store=False) as stream:
@@ -79,8 +79,13 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
                 result = await stream.get_final_response()
         self.assertEqual(result.output[0].type, 'custom_tool_call')
         self.assertEqual(result.output[0].input, raw)
+        opened = next(e.item for e in events if e.type == 'response.output_item.added')
+        self.assertEqual(opened.type, 'custom_tool_call')
+        self.assertEqual(opened.id, result.output[0].id)
+        self.assertFalse(any('function_call_arguments' in e.type for e in events))
+        self.assertEqual([e.sequence_number for e in events], list(range(len(events))))
         self.assertIn('response.custom_tool_call_input.done', [e.type for e in events])
-        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result('Done')) as backend:
+        with patch.object(script.NativeGeneration, 'stream', side_effect=lambda *a, **k: native_result('Done')) as backend:
             follow = await self.client.responses.create(model='local', store=False, tools=[tool], input=[
                 {'role': 'user', 'content': 'Create result.txt'}, result.output[0].model_dump(exclude_none=True),
                 {'type': 'custom_tool_call_output', 'call_id': 'patch_1', 'output': 'Success'}])
@@ -92,13 +97,13 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
         tool = {'type': 'function', 'name': 'read', 'strict': True, 'parameters': {
             'type': 'object', 'properties': {'id': {'type': 'integer'}}, 'required': ['id']}}
         calls = [{'id': 'bad', 'function': {'name': 'read', 'arguments': '{"id":"wrong"}'}}]
-        with patch.object(script.OAIcompletions, 'chat_completions', return_value=chat_result(None, calls, 'tool_calls')):
+        with patch.object(script.NativeGeneration, 'stream', side_effect=lambda *a, **k: native_result(None, calls, 'tool_calls')):
             # Disable SDK retries for this deterministic invalid model result.
             with self.assertRaisesRegex(openai.InternalServerError, 'strict schema validation'):
                 await self.client.with_options(max_retries=0).responses.create(model='local', input='Read', tools=[tool])
         def backend(*args, **kwargs):
-            yield {'choices': [{'delta': {'tool_calls': [{'index': 0, **calls[0]}]}, 'finish_reason': 'tool_calls'}]}
-        with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
+            yield from native_result(None, calls, 'tool_calls')
+        with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
                 patch('sse_starlette.sse.AppStatus.should_exit_event', None):
             stream = await self.client.responses.create(model='local', input='Read', tools=[tool], stream=True)
             events = [event async for event in stream]
@@ -113,12 +118,11 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
             def backend(*args, **kwargs):
                 if finish_reason == 'tool_calls':
                     for index in range(2):
-                        yield {'choices': [{'delta': {'tool_calls': [{'index': index, 'id': f'call_{index}',
-                            'function': {'name': 'lookup', 'arguments': json.dumps({'index': index})}}]}}]}
+                        yield EventBatch([ToolCallDelta(f'call_{index}', 'lookup', json.dumps({'index': index}), index)])
                 else:
-                    yield {'choices': [{'delta': {'content': 'Cut short'}}]}
-                yield {'choices': [{'delta': {}, 'finish_reason': finish_reason}]}
-            with patch.object(script.OAIcompletions, 'stream_chat_completions', side_effect=backend), \
+                    yield EventBatch([TextDelta('Cut short')])
+                yield EventBatch([DoneEvent(finish_reason)])
+            with patch.object(script.NativeGeneration, 'stream', side_effect=backend), \
                     patch('sse_starlette.sse.AppStatus.should_exit_event', None):
                 async with self.client.responses.stream(model='local', input='Hi', store=False,
                         tools=[{'type': 'function', 'name': 'lookup', 'strict': False}]) as stream:

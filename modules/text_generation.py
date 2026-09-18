@@ -29,8 +29,12 @@ def generate_reply(*args, **kwargs):
         and (shared.model.__class__.__name__ != 'LlamaServer' or shared.args.parallel > 1)
     )
 
-    if not use_parallel and shared.generation_lock is not None:
-        shared.generation_lock.acquire()
+    # Responses owns this lock across the complete turn, including retries.
+    # Do not reacquire its non-reentrant lock in a backend worker.
+    generation_lock = shared.generation_lock
+    acquire_lock = not use_parallel and generation_lock is not None and not state.get('_generation_lock_owned', False)
+    if acquire_lock:
+        generation_lock.acquire()
 
     with models._generation_count_lock:
         models.active_generation_count += 1
@@ -43,8 +47,8 @@ def generate_reply(*args, **kwargs):
             models.active_generation_count -= 1
 
         models.last_generation_time = time.time()
-        if not use_parallel and shared.generation_lock is not None:
-            shared.generation_lock.release()
+        if acquire_lock:
+            generation_lock.release()
 
 
 def _generate_reply(question, state, stopping_strings=None, is_chat=False, escape_html=False, for_ui=False):
