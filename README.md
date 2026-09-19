@@ -1,47 +1,65 @@
-# TextGen
+# TextGen — Local AI Workspace
 
-**A desktop app for local LLMs. Open source, no telemetry.** Text, vision, tool-calling, web search. UI + API.
+**Run local language models in a modern web interface, or connect them to your tools through a local API.** Chat, vision, tool calling, performance monitoring, and model evaluation in one workspace.
 
-[![GitHub stars](https://img.shields.io/github/stars/oobabooga/textgen?style=for-the-badge&logo=github&logoColor=white&labelColor=black)](https://github.com/oobabooga/textgen)
+This is [JackyYuenDacai's fork](https://github.com/JackyYuenDacai/textgen) of [oobabooga/textgen](https://github.com/oobabooga/textgen), focused on interface usability, ExLlamaV3 inference controls, API compatibility, and generation reliability.
 
-[![Chat mode](https://raw.githubusercontent.com/oobabooga/screenshots/refs/heads/main/CHAT-4.8.png)](https://raw.githubusercontent.com/oobabooga/screenshots/refs/heads/main/CHAT-4.8.png)
+[Get started](#get-started) · [Features](#features) · [Installation](#installation) · [Documentation](#documentation)
 
-## Get started in 1 minute
+## What this fork adds
 
-Download, unzip, double-click `textgen`. A window opens.
+| Area | Improvements |
+| --- | --- |
+| **Workspace layout** | Grouped navigation, page headings, compact character editors, organized settings cards, and responsive light/dark layouts. |
+| **Generation controls** | Collapsible sampling settings, context-length shortcuts, and ExLlamaV3 prefill, cache, and drafting controls. |
+| **Performance visibility** | A dashboard for request timings, token throughput, cache reuse, and draft acceptance where supported by the backend. |
+| **Capability benchmarks** | Run GSM8K, HumanEval, and IFEval evaluations through Inspect AI, inspect individual answers, and export saved reports. |
+| **Local API** | OpenAI-compatible Chat Completions and Responses endpoints, Anthropic-compatible Messages, and work on streaming, tool calls, and cancellation handling. |
 
-**https://github.com/oobabooga/textgen/releases**
+Performance and feature availability depend on the model, loader, hardware, and configuration. Benchmark scores describe the selected evaluation protocol and samples, rather than a universal model ranking.
 
-Portable builds for Linux, Windows, and macOS with CUDA, Vulkan, ROCm, and CPU-only options. All dependencies included. Compatible with GGUF (llama.cpp) models.
+## Get started
 
-For additional backends (ExLlamaV3, Transformers), training, image generation, and extensions, see [Installation](#installation).
+To use this fork's changes, install from this repository:
+
+```bash
+git clone https://github.com/JackyYuenDacai/textgen.git
+cd textgen
+```
+
+1. Run `start_windows.bat` on Windows, `./start_linux.sh` on Linux, or `./start_macos.sh` on macOS. The first launch installs dependencies and prompts for your GPU vendor.
+2. Open **http://127.0.0.1:7860**.
+3. Add a model to `user_data/models`, then select and load it on the **Model** page.
+4. Open **Chat** to start a conversation, or **Notebook** for free-form writing.
+
+For a lighter GGUF-only setup, see [Manual portable install with venv](#manual-portable-install-with-venv). For manual backend setup, see [Full installation](#full-installation).
+
+The [upstream portable releases](https://github.com/oobabooga/textgen/releases) provide the upstream desktop app; they do not include this fork's changes.
 
 ## Features
 
-### Chat & generation
+### Chat and creation
 
-- `instruct` mode for instruction-following (like ChatGPT), and `chat-instruct`/`chat` modes for talking to custom characters. Prompts are automatically formatted with Jinja2 templates.
-- **Vision (multimodal)**: Attach images to messages for visual understanding ([tutorial](https://github.com/oobabooga/textgen/wiki/Multimodal-Tutorial)).
-- **File attachments**: Upload text files, PDF documents, and .docx documents to talk about their contents.
-- Edit messages, navigate between message versions, and branch conversations at any point.
-- Notebook tab for free-form text generation outside of chat turns.
+- **Chat and characters:** instruction-following and character conversation modes, editable messages, response versions, and conversation branching.
+- **Vision and attachments:** use supported vision models with images, and attach text files, PDFs, or documents for discussion.
+- **Notebook:** a dedicated workspace for drafting and continuing text outside chat turns.
+- **Image generation:** a `diffusers` workspace with generation controls, a persistent gallery, and image metadata.
+- **LoRA training:** fine-tune supported models with conversation or text datasets, including resuming interrupted runs.
 
-### Backends & API
+### Models and tools
 
-- **Multiple backends**: [llama.cpp](https://github.com/ggerganov/llama.cpp), [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), [Transformers](https://github.com/huggingface/transformers), [ExLlamaV3](https://github.com/turboderp-org/exllamav3), and [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM). Switch between backends and models without restarting.
-- **OpenAI/Anthropic-compatible API**: Chat, Completions, and Messages endpoints with tool-calling support. Use as a local drop-in replacement for the OpenAI/Anthropic APIs ([examples](https://github.com/oobabooga/textgen/wiki/12-%E2%80%90-OpenAI-API#examples)).
-- **Tool-calling**: Models can call custom functions during chat, including web search, page fetching, and math. Each tool is a single `.py` file. MCP servers are also supported ([tutorial](https://github.com/oobabooga/textgen/wiki/Tool-Calling-Tutorial)).
+- **Multiple loaders:** llama.cpp, ik_llama.cpp, Transformers, ExLlamaV3, and TensorRT-LLM, subject to their installation and hardware requirements.
+- **Local APIs:** connect compatible applications using Chat Completions, Responses, or Messages endpoints. Enable the API with `--api`; see the [API guide](docs/12%20-%20OpenAI%20API.md) for configuration and supported behavior.
+- **Tool calling and MCP:** extend supported models with local functions, MCP servers, web search, and page fetching. Tool use depends on the model and prompt template.
+- **Inference tuning:** adjust sampling, context limits, prompt processing, memory use, and supported speculative decoding modes.
 
-### Training & image generation
+### Evaluation and usability
 
-- **Training**: Fine-tune LoRAs on multi-turn chat or raw text datasets. Supports resuming interrupted runs ([tutorial](https://github.com/oobabooga/textgen/wiki/05-%E2%80%90-Training-Tab)).
-- **Image generation**: A dedicated tab for `diffusers` models like **Z-Image-Turbo**. Features 4-bit/8-bit quantization and a persistent gallery with image metadata ([tutorial](https://github.com/oobabooga/textgen/wiki/Image-Generation-Tutorial)).
-
-### Privacy & interface
-
-- 100% offline and private, with zero telemetry, external resources, or remote update requests.
-- Dark/light themes, syntax highlighting for code blocks, and LaTeX rendering for mathematical expressions.
-- Built-in and community [extensions](https://github.com/oobabooga/textgen/wiki/07-%E2%80%90-Extensions) including TTS, voice input, and translation. See the [extensions directory](https://github.com/oobabooga/textgen-extensions) for the full list.
+- **Performance dashboard:** inspect backend metrics without manually reading server logs.
+- **Capability benchmarks:** evaluate maths, Python programming, and instruction following; save and compare run reports. HumanEval uses Docker Linux containers to execute generated code.
+- **Responsive interface:** grouped navigation, bounded editor sizes, keyboard-accessible sidebar controls, visible focus states, and reduced-motion support.
+- **Local operation:** inference can run offline once models and dependencies are installed. Downloads, web tools, remote MCP servers, and remote evaluation endpoints use the network when enabled.
+- **Extensions:** add capabilities such as speech input, text-to-speech, and translation through the upstream extension system.
 
 ## Downloading models
 
@@ -75,15 +93,15 @@ These formats require the full installation (not the portable build).
 
 ## Installation
 
-For the desktop app, see the [portable builds](https://github.com/oobabooga/textgen/releases). The options below run the web UI in your browser instead.
+The instructions below install this fork and run its web UI in your browser. Choose the portable configuration for GGUF models, or the full installation for additional loaders, training, image generation, and extensions.
 
 ### Manual portable install with venv
 
-Fast setup on any Python 3.9+:
+Create a virtual environment with a Python version supported by your selected requirements and backend wheels:
 
 ```bash
 # Clone repository
-git clone https://github.com/oobabooga/textgen
+git clone https://github.com/JackyYuenDacai/textgen.git
 cd textgen
 
 # Create virtual environment
@@ -114,7 +132,7 @@ For users who need additional backends (ExLlamaV3, Transformers), training, imag
 
 ### One-click installer
 
-1. Clone the repository, or [download its source code](https://github.com/oobabooga/textgen/archive/refs/heads/main.zip) and extract it.
+1. Clone the repository, or [download its source code](https://github.com/JackyYuenDacai/textgen/archive/refs/heads/main.zip) and extract it.
 2. Run the startup script for your OS: `start_windows.bat`, `start_linux.sh`, or `start_macos.sh`.
 3. When prompted, select your GPU vendor.
 4. After installation, open `http://127.0.0.1:7860` in your browser.
@@ -177,7 +195,7 @@ conda install -y -c "nvidia/label/cuda-12.8.1" cuda
 #### 3. Install the web UI
 
 ```
-git clone https://github.com/oobabooga/textgen
+git clone https://github.com/JackyYuenDacai/textgen.git
 cd textgen
 pip install -r requirements/full/<requirements file according to table below>
 ```
@@ -461,13 +479,29 @@ To pass extra flags, put each on its own line:
 
 ## Documentation
 
-https://github.com/oobabooga/textgen/wiki
+Start with the guides in this repository:
 
-## Community
+| Topic | Guide |
+| --- | --- |
+| Chat and attachments | [Chat](docs/01%20-%20Chat%20Tab.md) · [Multimodal tutorial](docs/Multimodal%20Tutorial.md) |
+| Models and generation | [Model page](docs/04%20-%20Model%20Tab.md) · [Parameters](docs/03%20-%20Parameters%20Tab.md) |
+| API clients | [API guide](docs/12%20-%20OpenAI%20API.md) |
+| Tools and MCP | [Tool-calling tutorial](docs/Tool%20Calling%20Tutorial.md) |
+| Inference performance | [ExLlamaV3 controls and metrics](docs/ExLlamaV3-performance.md) · [Prefill tuning](docs/ExLlamaV3-prefill.md) |
+| Model evaluation | [Capability benchmarks](docs/Capability-benchmarks.md) |
+| Creative workflows | [Image generation](docs/Image%20Generation%20Tutorial.md) · [LoRA training](docs/05%20-%20Training%20Tab.md) |
+| Keyboard navigation | [Keyboard shortcuts](docs/13%20-%20Keyboard%20Shortcuts.md) |
 
-[![Reddit](https://img.shields.io/reddit/subreddit-subscribers/Oobabooga?style=for-the-badge&logo=reddit&logoColor=white&label=r%2FOobabooga&labelColor=black&color=FF4500)](https://www.reddit.com/r/Oobabooga/)
+The [upstream wiki](https://github.com/oobabooga/textgen/wiki) provides additional background. Some local guides mirror upstream documentation and may show the original interface layout.
 
-## Acknowledgments
+## Feedback and contributions
 
-- In August 2023, [Andreessen Horowitz](https://a16z.com/) (a16z) provided a generous grant to encourage and support my independent work on this project. I am **extremely** grateful for their trust and recognition.
-- This project was inspired by [AUTOMATIC1111/stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) and wouldn't exist without it.
+Report fork-specific bugs or suggest improvements in [this repository's issues](https://github.com/JackyYuenDacai/textgen/issues). Include your operating system, loader, model, launch flags, and a minimal reproduction when relevant.
+
+The [upstream repository](https://github.com/oobabooga/textgen) and [r/Oobabooga](https://www.reddit.com/r/Oobabooga/) host the broader TextGen project and community.
+
+## License and acknowledgments
+
+TextGen is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+
+This fork builds on the work of [oobabooga and the TextGen contributors](https://github.com/oobabooga/textgen). The upstream project was inspired by [AUTOMATIC1111/stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) and received support from a16z in August 2023. Credit for the original application and its ecosystem remains with their respective authors.
