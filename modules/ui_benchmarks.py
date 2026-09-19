@@ -120,14 +120,14 @@ def export(run_id):
 
 
 def create_ui():
-    with gr.Tab('Benchmarks', elem_id='benchmarks-tab'):
+    with gr.Tab('Benchmarks', elem_id='benchmarks-tab', elem_classes=['workspace-page']):
         gr.Markdown('## Capability benchmarks\nEvaluate maths, Python programming, and instruction following using Inspect AI. '
                     'Datasets download on first use. Start with 10 samples to check your settings, then increase the sample count.')
         if shared.args.multi_user:
             gr.Markdown('Benchmark execution and saved reports are disabled in multi-user mode.')
             return
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column(scale=1, min_width=300, elem_classes=["workspace-card"]):
                 task = gr.Dropdown(choices=[(label, key) for key, label in TASKS.items()], value='gsm8k', label='Benchmark')
                 gr.Markdown('GSM8K uses zero-shot answer matching. HumanEval checks generated Python against unit tests in **Docker Linux containers**. '
                             'IFEval reports strict/loose instruction and prompt accuracy. No judge model is required.')

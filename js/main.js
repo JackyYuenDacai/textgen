@@ -680,6 +680,26 @@ navigationToggle.innerHTML = leftArrowSVG; // Set initial icon to right arrow
 navigationToggle.classList.add("navigation-left"); // Set initial position
 headerBar.appendChild(navigationToggle);
 
+// Make sidebar controls usable from the keyboard as well as a pointer.
+for (const [id, label] of [["navigation-toggle", "Toggle navigation"], ["past-chats-toggle", "Toggle conversations"], ["chat-controls-toggle", "Toggle chat settings"]]) {
+  const control = document.getElementById(id);
+  control.setAttribute("role", "button");
+  control.setAttribute("aria-label", label);
+  control.title = label;
+  control.tabIndex = 0;
+  control.addEventListener("keydown", event => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      control.click();
+    }
+  });
+}
+
+const navigationBrand = document.createElement("div");
+navigationBrand.className = "navigation-brand";
+navigationBrand.setAttribute("role", "presentation");
+navigationBrand.innerHTML = '<strong>TextGen<span>Local AI workspace</span></strong>';
+headerBar.prepend(navigationBrand);
 // Retrieve the dynamically created toggle buttons
 const pastChatsToggle = document.getElementById("past-chats-toggle");
 const chatControlsToggle = document.getElementById("chat-controls-toggle");
@@ -702,11 +722,12 @@ function handleIndividualSidebarClose(event) {
 }
 
 function setSidebarState(sidebar, toggle, hidden) {
+  toggle.setAttribute("aria-expanded", String(!hidden));
   sidebar.classList.toggle("sidebar-hidden", hidden);
   sidebar.classList.toggle("sidebar-shown", !hidden);
 
   if (sidebar === headerBar) {
-    document.documentElement.style.setProperty("--header-width", hidden ? "0px" : "112px");
+    document.documentElement.style.setProperty("--header-width", hidden ? "0px" : "var(--navigation-width)");
     pastChatsRow.classList.toggle("negative-header", hidden);
     pastChatsToggle.classList.toggle("negative-header", hidden);
     toggle.innerHTML = hidden ? hamburgerMenuSVG : closeMenuSVG;

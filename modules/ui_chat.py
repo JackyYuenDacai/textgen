@@ -152,9 +152,10 @@ def create_ui():
 
 def create_character_settings_ui():
     mu = shared.args.multi_user
-    with gr.Tab('Character', elem_id="character-tab"):
-        with gr.Row():
-            with gr.Column(scale=8):
+    with gr.Tab('Character', elem_id="character-tab", elem_classes=["workspace-page"]):
+        ui.create_page_header('Character', 'Shape your assistant, manage your profile, and import conversations.', 'Workspace')
+        with gr.Row(elem_classes=["workspace-columns"]):
+            with gr.Column(scale=3, min_width=320, elem_classes=["workspace-card", "character-editor"]):
                 with gr.Tab("Character"):
                     with gr.Row():
                         shared.gradio['character_menu'] = gr.Dropdown(value=shared.settings['character'], choices=utils.get_available_characters(), label='Character', elem_id='character-menu', info='Used in chat and chat-instruct modes.', elem_classes='slim-dropdown')
@@ -164,8 +165,8 @@ def create_character_settings_ui():
                         shared.gradio['restore_character'] = gr.Button('Restore character', elem_classes='refresh-button', interactive=True, elem_id='restore-character')
 
                     shared.gradio['name2'] = gr.Textbox(value=shared.settings['name2'], lines=1, label='Character\'s name')
-                    shared.gradio['context'] = gr.Textbox(value=shared.settings['context'], lines=10, label='Context', elem_classes=['add_scrollbar'], elem_id="character-context")
-                    shared.gradio['greeting'] = gr.Textbox(value=shared.settings['greeting'], lines=5, label='Greeting', elem_classes=['add_scrollbar'], elem_id="character-greeting")
+                    shared.gradio['context'] = gr.Textbox(value=shared.settings['context'], lines=8, max_lines=12, label='Context', info='Describe the assistant?s role, personality, and background.', elem_classes=['add_scrollbar'], elem_id="character-context")
+                    shared.gradio['greeting'] = gr.Textbox(value=shared.settings['greeting'], lines=3, max_lines=6, label='Greeting', info='The opening message for a new conversation.', elem_classes=['add_scrollbar'], elem_id="character-greeting")
 
                 with gr.Tab("User"):
                     with gr.Row():
@@ -204,9 +205,10 @@ def create_character_settings_ui():
 
                         shared.gradio['Submit tavern character'] = gr.Button(value='Submit', interactive=False)
 
-            with gr.Column(scale=1):
-                shared.gradio['character_picture'] = gr.Image(label='Character picture', type='filepath', interactive=not mu)
-                shared.gradio['your_picture'] = gr.Image(label='Your picture', type='filepath', value=Image.open(shared.user_data_dir / 'cache' / 'pfp_me.png') if (shared.user_data_dir / 'cache' / 'pfp_me.png').exists() else None, interactive=not mu)
+            with gr.Column(scale=1, min_width=240, elem_classes=["workspace-card", "portrait-panel"]):
+                gr.Markdown("### Profile images\nOptional pictures for your conversations.")
+                shared.gradio['character_picture'] = gr.Image(height=240, label='Character picture', type='filepath', interactive=not mu)
+                shared.gradio['your_picture'] = gr.Image(height=240, label='Your picture', type='filepath', value=Image.open(shared.user_data_dir / 'cache' / 'pfp_me.png') if (shared.user_data_dir / 'cache' / 'pfp_me.png').exists() else None, interactive=not mu)
 
 
 def create_chat_settings_ui():

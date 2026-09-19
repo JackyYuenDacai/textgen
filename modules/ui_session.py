@@ -57,9 +57,10 @@ def check_for_updates(local_version):
 def create_ui():
     mu = shared.args.multi_user
     portable_version = detect_portable_install() if shared.args.portable else None
-    with gr.Tab("Session", elem_id="session-tab"):
-        with gr.Row():
-            with gr.Column():
+    with gr.Tab("Session", elem_id="session-tab", elem_classes=["workspace-page"]):
+        ui.create_page_header('Session settings', 'Personalize your workspace, extensions, and API access.', 'Configure')
+        with gr.Row(elem_classes=["workspace-columns"]):
+            with gr.Column(elem_classes=["workspace-card"]):
                 gr.Markdown("## Settings")
                 if shared.is_electron:
                     with gr.Row():
@@ -78,7 +79,7 @@ def create_ui():
                     shared.gradio['check_updates'] = gr.Button('Check for updates 🔄', elem_classes=['refresh-button', 'settings-button'])
                     shared.gradio['update_status'] = gr.HTML(value='', elem_id='update-status')
 
-            with gr.Column():
+            with gr.Column(elem_classes=["workspace-card"]):
                 gr.Markdown("## Extensions & flags")
                 with gr.Row():
                     shared.gradio['save_settings'] = gr.Button(f'Save extensions settings to {shared.user_data_dir}/settings.yaml', elem_classes=['refresh-button', 'settings-button'], interactive=not mu)

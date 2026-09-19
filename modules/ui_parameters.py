@@ -8,7 +8,8 @@ from modules.utils import gradio
 
 def create_ui():
     mu = shared.args.multi_user
-    with gr.Tab("Parameters", elem_id="parameters"):
+    with gr.Tab("Parameters", elem_id="parameters", elem_classes=["workspace-page"]):
+        ui.create_page_header('Generation settings', 'Tune response length, sampling, and prompt templates.', 'Configure')
         with gr.Tab("Generation"):
             with gr.Row():
                 with gr.Column():
@@ -23,62 +24,63 @@ def create_ui():
                 with gr.Column():
                     shared.gradio['filter_by_loader'] = gr.Dropdown(label="Filter by loader", choices=["All"] + list(loaders.loaders_and_params.keys()) if not shared.args.portable else ['llama.cpp'], value="All", elem_classes='slim-dropdown')
 
-            with gr.Row():
+            with gr.Row(elem_classes=["parameter-grid"]):
                 with gr.Column():
                     with gr.Row():
-                        with gr.Column():
-                            gr.Markdown('## Curve shape')
-                            shared.gradio['temperature'] = gr.Slider(0.01, 5, value=shared.settings['temperature'], step=0.01, label='temperature')
-                            shared.gradio['dynatemp_low'] = gr.Slider(0.01, 5, value=shared.settings['dynatemp_low'], step=0.01, label='dynatemp_low', visible=shared.settings['dynamic_temperature'])
-                            shared.gradio['dynatemp_high'] = gr.Slider(0.01, 5, value=shared.settings['dynatemp_high'], step=0.01, label='dynatemp_high', visible=shared.settings['dynamic_temperature'])
-                            shared.gradio['dynatemp_exponent'] = gr.Slider(0.01, 5, value=shared.settings['dynatemp_exponent'], step=0.01, label='dynatemp_exponent', visible=shared.settings['dynamic_temperature'])
-                            shared.gradio['smoothing_factor'] = gr.Slider(0.0, 10.0, value=shared.settings['smoothing_factor'], step=0.01, label='smoothing_factor', info='Activates Quadratic Sampling.')
-                            shared.gradio['smoothing_curve'] = gr.Slider(1.0, 10.0, value=shared.settings['smoothing_curve'], step=0.01, label='smoothing_curve', info='Adjusts the dropoff curve of Quadratic Sampling.')
-                            shared.gradio['dynamic_temperature'] = gr.Checkbox(value=shared.settings['dynamic_temperature'], label='dynamic_temperature')
+                        with gr.Column(min_width=260, elem_classes=["workspace-card"]):
+                            with gr.Accordion('Curve shape', open=True):
+                                shared.gradio['temperature'] = gr.Slider(0.01, 5, value=shared.settings['temperature'], step=0.01, label='temperature')
+                                shared.gradio['dynatemp_low'] = gr.Slider(0.01, 5, value=shared.settings['dynatemp_low'], step=0.01, label='dynatemp_low', visible=shared.settings['dynamic_temperature'])
+                                shared.gradio['dynatemp_high'] = gr.Slider(0.01, 5, value=shared.settings['dynatemp_high'], step=0.01, label='dynatemp_high', visible=shared.settings['dynamic_temperature'])
+                                shared.gradio['dynatemp_exponent'] = gr.Slider(0.01, 5, value=shared.settings['dynatemp_exponent'], step=0.01, label='dynatemp_exponent', visible=shared.settings['dynamic_temperature'])
+                                shared.gradio['smoothing_factor'] = gr.Slider(0.0, 10.0, value=shared.settings['smoothing_factor'], step=0.01, label='smoothing_factor', info='Activates Quadratic Sampling.')
+                                shared.gradio['smoothing_curve'] = gr.Slider(1.0, 10.0, value=shared.settings['smoothing_curve'], step=0.01, label='smoothing_curve', info='Adjusts the dropoff curve of Quadratic Sampling.')
+                                shared.gradio['dynamic_temperature'] = gr.Checkbox(value=shared.settings['dynamic_temperature'], label='dynamic_temperature')
 
-                            gr.Markdown('## Curve cutoff')
-                            shared.gradio['top_p'] = gr.Slider(0.0, 1.0, value=shared.settings['top_p'], step=0.01, label='top_p')
-                            shared.gradio['top_k'] = gr.Slider(0, 200, value=shared.settings['top_k'], step=1, label='top_k')
-                            shared.gradio['min_p'] = gr.Slider(0.0, 1.0, value=shared.settings['min_p'], step=0.01, label='min_p')
-                            shared.gradio['top_n_sigma'] = gr.Slider(0.0, 5.0, value=shared.settings['top_n_sigma'], step=0.01, label='top_n_sigma')
-                            shared.gradio['typical_p'] = gr.Slider(0.0, 1.0, value=shared.settings['typical_p'], step=0.01, label='typical_p')
-                            shared.gradio['xtc_threshold'] = gr.Slider(0, 0.5, value=shared.settings['xtc_threshold'], step=0.01, label='xtc_threshold', info='If 2 or more tokens have probability above this threshold, consider removing all but the last one.')
-                            shared.gradio['xtc_probability'] = gr.Slider(0, 1, value=shared.settings['xtc_probability'], step=0.01, label='xtc_probability', info='Probability that the removal will actually happen. 0 disables the sampler. 1 makes it always happen.')
-                            shared.gradio['epsilon_cutoff'] = gr.Slider(0, 9, value=shared.settings['epsilon_cutoff'], step=0.01, label='epsilon_cutoff')
-                            shared.gradio['eta_cutoff'] = gr.Slider(0, 20, value=shared.settings['eta_cutoff'], step=0.01, label='eta_cutoff')
-                            shared.gradio['tfs'] = gr.Slider(0.0, 1.0, value=shared.settings['tfs'], step=0.01, label='tfs')
-                            shared.gradio['top_a'] = gr.Slider(0.0, 1.0, value=shared.settings['top_a'], step=0.01, label='top_a')
+                            with gr.Accordion('Curve cutoff', open=False):
+                                shared.gradio['top_p'] = gr.Slider(0.0, 1.0, value=shared.settings['top_p'], step=0.01, label='top_p')
+                                shared.gradio['top_k'] = gr.Slider(0, 200, value=shared.settings['top_k'], step=1, label='top_k')
+                                shared.gradio['min_p'] = gr.Slider(0.0, 1.0, value=shared.settings['min_p'], step=0.01, label='min_p')
+                                shared.gradio['top_n_sigma'] = gr.Slider(0.0, 5.0, value=shared.settings['top_n_sigma'], step=0.01, label='top_n_sigma')
+                                shared.gradio['typical_p'] = gr.Slider(0.0, 1.0, value=shared.settings['typical_p'], step=0.01, label='typical_p')
+                                shared.gradio['xtc_threshold'] = gr.Slider(0, 0.5, value=shared.settings['xtc_threshold'], step=0.01, label='xtc_threshold', info='If 2 or more tokens have probability above this threshold, consider removing all but the last one.')
+                                shared.gradio['xtc_probability'] = gr.Slider(0, 1, value=shared.settings['xtc_probability'], step=0.01, label='xtc_probability', info='Probability that the removal will actually happen. 0 disables the sampler. 1 makes it always happen.')
+                                shared.gradio['epsilon_cutoff'] = gr.Slider(0, 9, value=shared.settings['epsilon_cutoff'], step=0.01, label='epsilon_cutoff')
+                                shared.gradio['eta_cutoff'] = gr.Slider(0, 20, value=shared.settings['eta_cutoff'], step=0.01, label='eta_cutoff')
+                                shared.gradio['tfs'] = gr.Slider(0.0, 1.0, value=shared.settings['tfs'], step=0.01, label='tfs')
+                                shared.gradio['top_a'] = gr.Slider(0.0, 1.0, value=shared.settings['top_a'], step=0.01, label='top_a')
 
-                            gr.Markdown('## Repetition suppression')
-                            shared.gradio['dry_multiplier'] = gr.Slider(0, 5, value=shared.settings['dry_multiplier'], step=0.01, label='dry_multiplier', info='Set to greater than 0 to enable DRY. Recommended value: 0.8.')
-                            shared.gradio['dry_allowed_length'] = gr.Slider(1, 20, value=shared.settings['dry_allowed_length'], step=1, label='dry_allowed_length', info='Longest sequence that can be repeated without being penalized.')
-                            shared.gradio['dry_base'] = gr.Slider(1, 4, value=shared.settings['dry_base'], step=0.01, label='dry_base', info='Controls how fast the penalty grows with increasing sequence length.')
-                            shared.gradio['repetition_penalty'] = gr.Slider(1.0, 1.5, value=shared.settings['repetition_penalty'], step=0.01, label='repetition_penalty')
-                            shared.gradio['frequency_penalty'] = gr.Slider(0, 2, value=shared.settings['frequency_penalty'], step=0.05, label='frequency_penalty')
-                            shared.gradio['presence_penalty'] = gr.Slider(0, 2, value=shared.settings['presence_penalty'], step=0.05, label='presence_penalty')
-                            shared.gradio['encoder_repetition_penalty'] = gr.Slider(0.8, 1.5, value=shared.settings['encoder_repetition_penalty'], step=0.01, label='encoder_repetition_penalty')
-                            shared.gradio['no_repeat_ngram_size'] = gr.Slider(0, 20, step=1, value=shared.settings['no_repeat_ngram_size'], label='no_repeat_ngram_size')
-                            shared.gradio['repetition_penalty_range'] = gr.Slider(0, 4096, step=64, value=shared.settings['repetition_penalty_range'], label='repetition_penalty_range')
+                            with gr.Accordion('Repetition suppression', open=False):
+                                shared.gradio['dry_multiplier'] = gr.Slider(0, 5, value=shared.settings['dry_multiplier'], step=0.01, label='dry_multiplier', info='Set to greater than 0 to enable DRY. Recommended value: 0.8.')
+                                shared.gradio['dry_allowed_length'] = gr.Slider(1, 20, value=shared.settings['dry_allowed_length'], step=1, label='dry_allowed_length', info='Longest sequence that can be repeated without being penalized.')
+                                shared.gradio['dry_base'] = gr.Slider(1, 4, value=shared.settings['dry_base'], step=0.01, label='dry_base', info='Controls how fast the penalty grows with increasing sequence length.')
+                                shared.gradio['repetition_penalty'] = gr.Slider(1.0, 1.5, value=shared.settings['repetition_penalty'], step=0.01, label='repetition_penalty')
+                                shared.gradio['frequency_penalty'] = gr.Slider(0, 2, value=shared.settings['frequency_penalty'], step=0.05, label='frequency_penalty')
+                                shared.gradio['presence_penalty'] = gr.Slider(0, 2, value=shared.settings['presence_penalty'], step=0.05, label='presence_penalty')
+                                shared.gradio['encoder_repetition_penalty'] = gr.Slider(0.8, 1.5, value=shared.settings['encoder_repetition_penalty'], step=0.01, label='encoder_repetition_penalty')
+                                shared.gradio['no_repeat_ngram_size'] = gr.Slider(0, 20, step=1, value=shared.settings['no_repeat_ngram_size'], label='no_repeat_ngram_size')
+                                shared.gradio['repetition_penalty_range'] = gr.Slider(0, 4096, step=64, value=shared.settings['repetition_penalty_range'], label='repetition_penalty_range')
 
-                        with gr.Column():
-                            gr.Markdown('## Alternative sampling methods')
-                            shared.gradio['penalty_alpha'] = gr.Slider(0, 5, value=shared.settings['penalty_alpha'], label='penalty_alpha', info='For Contrastive Search. do_sample must be unchecked.')
-                            shared.gradio['guidance_scale'] = gr.Slider(-0.5, 2.5, step=0.05, value=shared.settings['guidance_scale'], label='guidance_scale', info='For CFG. 1.5 is a good value.')
-                            shared.gradio['mirostat_mode'] = gr.Slider(0, 2, step=1, value=shared.settings['mirostat_mode'], label='mirostat_mode', info='mode=1 is for llama.cpp only.')
-                            shared.gradio['mirostat_tau'] = gr.Slider(0, 10, step=0.01, value=shared.settings['mirostat_tau'], label='mirostat_tau')
-                            shared.gradio['mirostat_eta'] = gr.Slider(0, 1, step=0.01, value=shared.settings['mirostat_eta'], label='mirostat_eta')
-                            shared.gradio['adaptive_target'] = gr.Slider(0.0, 1.0, value=shared.settings['adaptive_target'], step=0.01, label='adaptive_target', info='Target probability for adaptive-p sampling. Tokens near this probability are favored. 0 disables.')
-                            shared.gradio['adaptive_decay'] = gr.Slider(0.0, 0.99, value=shared.settings['adaptive_decay'], step=0.01, label='adaptive_decay', info='EMA decay rate for adaptive-p. Controls history window (~1/(1-decay) tokens). Default: 0.9.')
+                        with gr.Column(min_width=260, elem_classes=["workspace-card"]):
+                            with gr.Accordion('Alternative sampling methods', open=False):
+                                shared.gradio['penalty_alpha'] = gr.Slider(0, 5, value=shared.settings['penalty_alpha'], label='penalty_alpha', info='For Contrastive Search. do_sample must be unchecked.')
+                                shared.gradio['guidance_scale'] = gr.Slider(-0.5, 2.5, step=0.05, value=shared.settings['guidance_scale'], label='guidance_scale', info='For CFG. 1.5 is a good value.')
+                                shared.gradio['mirostat_mode'] = gr.Slider(0, 2, step=1, value=shared.settings['mirostat_mode'], label='mirostat_mode', info='mode=1 is for llama.cpp only.')
+                                shared.gradio['mirostat_tau'] = gr.Slider(0, 10, step=0.01, value=shared.settings['mirostat_tau'], label='mirostat_tau')
+                                shared.gradio['mirostat_eta'] = gr.Slider(0, 1, step=0.01, value=shared.settings['mirostat_eta'], label='mirostat_eta')
+                                shared.gradio['adaptive_target'] = gr.Slider(0.0, 1.0, value=shared.settings['adaptive_target'], step=0.01, label='adaptive_target', info='Target probability for adaptive-p sampling. Tokens near this probability are favored. 0 disables.')
+                                shared.gradio['adaptive_decay'] = gr.Slider(0.0, 0.99, value=shared.settings['adaptive_decay'], step=0.01, label='adaptive_decay', info='EMA decay rate for adaptive-p. Controls history window (~1/(1-decay) tokens). Default: 0.9.')
 
-                            gr.Markdown('## Other options')
-                            shared.gradio['do_sample'] = gr.Checkbox(value=shared.settings['do_sample'], label='do_sample')
-                            shared.gradio['temperature_last'] = gr.Checkbox(value=shared.settings['temperature_last'], label='temperature_last', info='Moves temperature/dynamic temperature/quadratic sampling to the end of the sampler stack, ignoring their positions in "Sampler priority".')
-                            shared.gradio['sampler_priority'] = gr.DragDrop(value=shared.settings['sampler_priority'], label='Sampler priority', info='Parameter names separated by new lines or commas.', elem_classes=['add_scrollbar'])
-                            shared.gradio['dry_sequence_breakers'] = gr.Textbox(value=shared.settings['dry_sequence_breakers'], label='dry_sequence_breakers', info='Tokens across which sequence matching is not continued. Specified as a comma-separated list of quoted strings.')
+                            with gr.Accordion('Other options', open=False):
+                                shared.gradio['do_sample'] = gr.Checkbox(value=shared.settings['do_sample'], label='do_sample')
+                                shared.gradio['temperature_last'] = gr.Checkbox(value=shared.settings['temperature_last'], label='temperature_last', info='Moves temperature/dynamic temperature/quadratic sampling to the end of the sampler stack, ignoring their positions in "Sampler priority".')
+                                shared.gradio['sampler_priority'] = gr.DragDrop(value=shared.settings['sampler_priority'], label='Sampler priority', info='Parameter names separated by new lines or commas.', elem_classes=['add_scrollbar'])
+                                shared.gradio['dry_sequence_breakers'] = gr.Textbox(value=shared.settings['dry_sequence_breakers'], label='dry_sequence_breakers', info='Tokens across which sequence matching is not continued. Specified as a comma-separated list of quoted strings.')
 
                 with gr.Column():
                     with gr.Row():
-                        with gr.Column():
+                        with gr.Column(min_width=260, elem_classes=["workspace-card"]):
+                            gr.Markdown("### Response output")
                             with gr.Blocks():
                                 shared.gradio['max_new_tokens'] = gr.Slider(minimum=shared.settings['max_new_tokens_min'], maximum=shared.settings['max_new_tokens_max'], value=shared.settings['max_new_tokens'], step=1, label='max_new_tokens', info='⚠️ Setting this too high can cause prompt truncation.')
                                 shared.gradio['prompt_lookup_num_tokens'] = gr.Slider(value=shared.settings['prompt_lookup_num_tokens'], minimum=0, maximum=10, step=1, label='prompt_lookup_num_tokens', info='Activates Prompt Lookup Decoding.')
@@ -91,7 +93,8 @@ def create_ui():
                             shared.gradio['stream'] = gr.Checkbox(value=shared.settings['stream'], label='Activate text streaming')
                             shared.gradio['static_cache'] = gr.Checkbox(value=shared.settings['static_cache'], label='Static KV cache', info='Use a static cache for improved performance.')
 
-                        with gr.Column():
+                        with gr.Column(min_width=260, elem_classes=["workspace-card"]):
+                            gr.Markdown("### Context & constraints")
                             shared.gradio['truncation_length'] = gr.Number(precision=0, step=256, value=get_truncation_length(), label='Truncate the prompt up to this length', info='The leftmost tokens are removed if the prompt exceeds this length.')
                             with gr.Row():
                                 shared.gradio['context_32k'] = gr.Button('32k context', size='sm')

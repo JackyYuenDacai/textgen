@@ -356,7 +356,8 @@ def create_ui():
     if shared.settings['image_model_menu'] != 'None':
         shared.image_model_name = shared.settings['image_model_menu']
 
-    with gr.Tab("Image AI", elem_id="image-ai-tab"):
+    with gr.Tab("Image AI", elem_id="image-ai-tab", elem_classes=["workspace-page"]):
+        ui.create_page_header('Image studio', 'Create images, explore your gallery, and manage image models.', 'Workspace')
         with gr.Tabs():
             # TAB 1: GENERATE
             with gr.TabItem("Generate"):
@@ -429,7 +430,7 @@ def create_ui():
                                 shared.gradio['image_batch_size'] = gr.Slider(1, 32, value=shared.settings['image_batch_size'], step=1, label="Batch Size (VRAM Heavy)", info="Generates N images at once.")
                                 shared.gradio['image_batch_count'] = gr.Slider(1, 128, value=shared.settings['image_batch_count'], step=1, label="Sequential Count (Loop)", info="Repeats the generation N times.")
 
-                    with gr.Column(scale=6, min_width=500):
+                    with gr.Column(scale=6, min_width=320, elem_classes=["workspace-card"]):
                         with gr.Column(elem_classes=["viewport-container"]):
                             shared.gradio['image_output_gallery'] = gr.Gallery(label="Output", show_label=False, columns=2, rows=2, height="80vh", object_fit="contain", preview=True, elem_id="image-output-gallery")
 

@@ -34,11 +34,12 @@ train_template = {}
 
 def create_ui():
     mu = shared.args.multi_user
-    with gr.Tab("Training", elem_id="training-tab"):
+    with gr.Tab("Training", elem_id="training-tab", elem_classes=["workspace-page"]):
+        ui.create_page_header('Training studio', 'Prepare a dataset, configure a LoRA, and follow training progress.', 'Evaluate')
         with gr.Tab('Train LoRA', elem_id='lora-train-tab'):
             tmp = gr.State('')
             with gr.Row():
-                with gr.Column():
+                with gr.Column(elem_classes=["workspace-card"]):
                     gr.Markdown("[Tutorial](https://github.com/oobabooga/textgen/wiki/05-%E2%80%90-Training-Tab)")
 
                     with gr.Row():
@@ -100,7 +101,7 @@ def create_ui():
                                 excess_length = gr.Dropdown(label='Excess length', value='drop', choices=['drop', 'truncate'], info='What to do with conversations that exceed the cutoff length. "Drop" removes them entirely (recommended). "Truncate" cuts from the right, which may produce incomplete responses.', elem_classes=['slim-dropdown'])
                                 report_to = gr.Radio(label="Save detailed logs with", value="None", choices=["None", "wandb", "tensorboard"], interactive=True)
 
-                with gr.Column():
+                with gr.Column(elem_classes=["workspace-card"]):
                     with gr.Tab(label='Chat Dataset'):
                         with gr.Row():
                             dataset = gr.Dropdown(choices=utils.get_chat_datasets(str(shared.user_data_dir / 'training/datasets')), value='None', label='Dataset File', info='A JSON file with chat conversations (messages or ShareGPT format). Each row is one conversation.', elem_classes=['slim-dropdown'], interactive=not mu)
@@ -131,7 +132,7 @@ def create_ui():
 
         with gr.Tab('Perplexity evaluation', elem_id='evaluate-tab'):
             with gr.Row():
-                with gr.Column():
+                with gr.Column(elem_classes=["workspace-card"]):
                     models = gr.Dropdown(utils.get_available_models(), label='Models', multiselect=True, interactive=not mu)
                     evaluate_text_file = gr.Dropdown(choices=['wikitext', 'ptb', 'ptb_new'] + utils.get_datasets(str(shared.user_data_dir / 'training/datasets'), 'txt')[1:], value='wikitext', label='Input dataset', info=f'The raw text file on which the model will be evaluated. The first options are automatically downloaded: wikitext, ptb, and ptb_new. The next options are your local text files under {shared.user_data_dir}/training/datasets.', interactive=not mu)
                     with gr.Row():
@@ -146,7 +147,7 @@ def create_ui():
                         start_evaluation = gr.Button("Evaluate selected models", interactive=not mu)
                         stop_evaluation = gr.Button("Interrupt", interactive=not mu)
 
-                with gr.Column():
+                with gr.Column(elem_classes=["workspace-card"]):
                     evaluation_log = gr.Markdown(value='')
 
             evaluation_table = gr.Dataframe(value=generate_markdown_table(), interactive=True)

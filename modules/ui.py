@@ -1,4 +1,5 @@
 import copy
+from html import escape
 import threading
 from pathlib import Path
 
@@ -124,10 +125,57 @@ if not shared.args.old_colors:
         button_transition='background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease',
     )
 
+# Bind Gradio form controls to the same palette as the custom chat/dashboard UI.
+if not shared.args.old_colors:
+    theme = theme.set(
+        body_background_fill='var(--bg-body)',
+        body_background_fill_dark='var(--bg-body)',
+        body_text_color='var(--text)',
+        body_text_color_dark='var(--text)',
+        body_text_color_subdued='var(--text-muted)',
+        body_text_color_subdued_dark='var(--text-muted)',
+        input_background_fill='var(--bg-input)',
+        input_background_fill_dark='var(--bg-input)',
+        input_border_color='var(--border)',
+        input_border_color_dark='var(--border)',
+        input_border_color_focus='var(--accent)',
+        input_border_color_focus_dark='var(--accent)',
+        input_radius='10px',
+        button_primary_background_fill='var(--accent)',
+        button_primary_background_fill_dark='var(--accent)',
+        button_primary_background_fill_hover='var(--accent-hover)',
+        button_primary_background_fill_hover_dark='var(--accent-hover)',
+        button_primary_border_color_dark='var(--accent)',
+        button_primary_text_color_dark='#101722',
+        button_secondary_background_fill='var(--bg-elevated)',
+        button_secondary_background_fill_dark='var(--bg-elevated)',
+        button_secondary_background_fill_hover='var(--bg-hover)',
+        button_secondary_background_fill_hover_dark='var(--bg-hover)',
+        button_large_padding='10px 16px',
+        block_label_text_color='var(--text)',
+        block_label_text_color_dark='var(--text)',
+        block_info_text_color='var(--text-muted)',
+        block_info_text_color_dark='var(--text-muted)',
+        slider_color='var(--accent)',
+        slider_color_dark='var(--accent)',
+        checkbox_background_color_selected='var(--accent)',
+        checkbox_background_color_selected_dark='var(--accent)',
+    )
+
 if (shared.user_data_dir / "notification.mp3").exists():
     audio_notification_js = "document.querySelector('#audio_notification audio')?.play();"
 else:
     audio_notification_js = ""
+
+
+
+def create_page_header(title, description, section='Workspace'):
+    """A consistent heading for every full-page workspace."""
+    gr.HTML(
+        f'<header class="workspace-heading"><span class="workspace-eyebrow">{escape(section)}</span>'
+        f'<h1>{escape(title)}</h1><p>{escape(description)}</p></header>',
+        elem_classes=['workspace-heading-block'],
+    )
 
 
 def list_model_elements():

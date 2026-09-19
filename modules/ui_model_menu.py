@@ -53,9 +53,10 @@ def loader_spec_overlay(loader, spec_type):
 def create_ui():
     mu = shared.args.multi_user
 
-    with gr.Tab("Model", elem_id="model-tab"):
-        with gr.Row():
-            with gr.Column():
+    with gr.Tab("Model", elem_id="model-tab", elem_classes=["workspace-page"]):
+        ui.create_page_header('Model library', 'Load a model and configure how it runs on your hardware.', 'Configure')
+        with gr.Row(elem_classes=["workspace-columns"]):
+            with gr.Column(elem_classes=["workspace-card"]):
                 with gr.Row():
                     shared.gradio['model_menu'] = gr.Dropdown(choices=utils.get_available_models(), value=lambda: shared.model_name, label='Model', elem_classes='slim-dropdown', interactive=not mu)
                     ui.create_refresh_button(shared.gradio['model_menu'], lambda: None, lambda: {'choices': utils.get_available_models()}, 'refresh-button', interactive=not mu)
@@ -156,7 +157,7 @@ def create_ui():
                                         ui.create_refresh_button(shared.gradio['lora_menu'], lambda: None, lambda: {'choices': utils.get_available_loras(), 'value': shared.lora_names}, 'refresh-button', interactive=not mu)
                                         shared.gradio['lora_menu_apply'] = gr.Button(value='Apply LoRAs', elem_classes='refresh-button', interactive=not mu)
 
-            with gr.Column():
+            with gr.Column(elem_classes=["workspace-card"]):
                 with gr.Tab("Download"):
                     shared.gradio['custom_model_menu'] = gr.Textbox(label="Download model or LoRA", info="Enter the Hugging Face username/model path, for instance: facebook/galactica-125m. To specify a branch, add it at the end after a \":\" character like this: facebook/galactica-125m:main. To download a single file, enter its name in the second box.", interactive=not mu)
                     shared.gradio['download_specific_file'] = gr.Textbox(placeholder="File name (for GGUF models)", show_label=False, max_lines=1, interactive=not mu)

@@ -327,7 +327,7 @@ def render_performance_dashboard():
 def create_ui():
     import gradio as gr
 
-    with gr.Tab('Performance', elem_id='performance-tab'):
+    with gr.Tab('Performance', elem_id='performance-tab', elem_classes=['workspace-page']):
         shared.gradio['performance_dashboard'] = gr.HTML(
             value=render_performance_dashboard,
             every=REFRESH_SECONDS,

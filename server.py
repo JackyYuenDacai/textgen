@@ -188,19 +188,23 @@ def create_interface():
         ui_chat.create_ui()
 
         # Notebook tab
-        with gr.Tab("Notebook", elem_id='notebook-parent-tab'):
+        with gr.Tab("Notebook", elem_id='notebook-parent-tab', elem_classes=["workspace-page"]):
+            ui.create_page_header('Notebook', 'A focused workspace for drafting, continuing, and comparing text.', 'Workspace')
             ui_default.create_ui()
             ui_notebook.create_ui()
 
-        ui_parameters.create_ui()  # Parameters tab
-        ui_chat.create_character_settings_ui()  # Character tab
-        ui_model_menu.create_ui()  # Model tab
-        ui_performance.create_ui()  # Performance tab
-        ui_benchmarks.create_ui()  # Capability benchmarks tab
+        ui_chat.create_character_settings_ui()
         if not shared.args.portable:
-            ui_image_generation.create_ui()  # Image generation tab
-            training.create_ui()  # Training tab
-        ui_session.create_ui()  # Session tab
+            ui_image_generation.create_ui()
+
+        ui_model_menu.create_ui()
+        ui_parameters.create_ui()
+        ui_session.create_ui()
+
+        ui_performance.create_ui()
+        ui_benchmarks.create_ui()
+        if not shared.args.portable:
+            training.create_ui()
 
         # Generation events
         ui_chat.create_event_handlers()
