@@ -9,7 +9,11 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
+from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 from typing import Any, List
 
 import requests
@@ -42,6 +46,10 @@ class LlamaServer:
         self.bos_token = "<s>"
         self.media_marker = "<__media__>"
         self.last_prompt_token_count = 0
+        self.performance_history = deque(maxlen=100)
+        self.performance_lock = threading.Lock()
+        self.performance_sequence = 0
+        self.performance_session = uuid4().hex
 
         # Start the server
         self._start_server()
@@ -175,7 +183,50 @@ class LlamaServer:
         """Check if this model supports multimodal input."""
         return shared.args.mmproj not in [None, 'None']
 
+    def get_performance_stats(self):
+        """Expose native llama.cpp request timings to the dashboard and model API."""
+        with self.performance_lock:
+            recent = deepcopy(list(self.performance_history))
+            history = {
+                'session_id': self.performance_session,
+                'capacity': self.performance_history.maxlen,
+                'retained': len(recent),
+                'total_recorded': self.performance_sequence,
+                'dropped': self.performance_sequence - len(recent),
+                'first_sequence': recent[0]['sequence'] if recent else None,
+                'last_sequence': recent[-1]['sequence'] if recent else None,
+            }
+        return {'recent_requests': recent, 'history': history}
+
+    def _record_performance(self, metrics, result):
+        timings = result.get('timings') or {}
+        metrics.update({
+            'new_tokens': result.get('tokens_predicted', timings.get('predicted_n')),
+            'prompt_tokens': result.get('tokens_evaluated', metrics['prompt_tokens']),
+            # tokens_cached is the KV size at exit, not the reused prompt count.
+            'cached_tokens': timings.get('cache_n'),
+            'decode_tokens_per_second': timings.get('predicted_per_second'),
+            'prefill_tokens_per_second': timings.get('prompt_per_second'),
+            'eos_reason': result.get('stop_type'),
+        })
+        for source, target in [('prompt_ms', 'time_prefill'), ('predicted_ms', 'time_generate')]:
+            if timings.get(source) is not None:
+                metrics[target] = timings[source] / 1000
+
+        # Older backends omit cache_n but report total and uncached prompt counts.
+        if metrics['cached_tokens'] is None and timings.get('prompt_n') is not None and result.get('tokens_evaluated') is not None:
+            metrics['cached_tokens'] = max(0, result['tokens_evaluated'] - timings['prompt_n'])
+        if timings.get('draft_n', 0) > 0 and timings.get('draft_n_accepted') is not None:
+            metrics['draft_acceptance'] = timings['draft_n_accepted'] / timings['draft_n']
+
+        with self.performance_lock:
+            self.performance_sequence += 1
+            self.performance_history.append(dict(
+                metrics, job_id=self.performance_sequence, sequence=self.performance_sequence,
+                recorded_at=datetime.now(timezone.utc).isoformat()))
+
     def generate_with_streaming(self, prompt, state):
+        started = time.perf_counter()
         url = f"http://127.0.0.1:{self.port}/completion"
         payload = self.prepare_payload(state)
 
@@ -227,9 +278,12 @@ class LlamaServer:
         self.last_completion_probabilities = []
         self.last_completion_token_count = 0
 
-        # Make the generation request
-        response = self.session.post(url, json=payload, stream=True)
+        metrics = {'completed': False, 'prompt_tokens': self.last_prompt_token_count,
+                   'time_to_first_output': None}
+        result = {}
+        response = None
         try:
+            response = self.session.post(url, json=payload, stream=True)
             if response.status_code == 400 and response.json().get("error", {}).get("type") == "exceed_context_size_error":
                 logger.error("The request exceeds the available context size, try increasing it")
                 return
@@ -252,22 +306,34 @@ class LlamaServer:
                     if line.startswith('data: '):
                         line = line[6:]  # Remove the "data: " prefix
 
-                    # Parse the JSON data
+                    if line == '[DONE]':
+                        break
                     data = json.loads(line)
+
+                    # Keep only telemetry, never prompts or generated text. Capture
+                    # it before yielding so generator.close() retains final stats.
+                    for key in ('tokens_predicted', 'tokens_evaluated', 'timings', 'stop_type'):
+                        if key in data:
+                            result[key] = data[key]
+                    metrics['completed'] = bool(data.get('stop', False))
 
                     # Extract the token content
                     if data.get('content', ''):
                         full_text += data['content']
                         self.last_completion_token_count += 1
-                        yield full_text
+                        if metrics['time_to_first_output'] is None:
+                            metrics['time_to_first_output'] = time.perf_counter() - started
+
+                    if 'tokens_predicted' in data:
+                        self.last_completion_token_count = data['tokens_predicted']
 
                     # Capture logprobs if present
                     if 'completion_probabilities' in data:
                         self.last_completion_probabilities.extend(data['completion_probabilities'])
 
+                    if data.get('content', ''):
+                        yield full_text
                     if data.get('stop', False):
-                        # Server count includes speculative-decode tokens our per-chunk counter misses.
-                        self.last_completion_token_count = data.get('tokens_predicted', self.last_completion_token_count)
                         break
 
                 except json.JSONDecodeError as e:
@@ -276,7 +342,12 @@ class LlamaServer:
                     print(f"Problematic line: {line}")
                     continue
         finally:
-            response.close()
+            metrics['total_seconds'] = time.perf_counter() - started
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                self._record_performance(metrics, result)
 
     def generate(self, prompt, state):
         output = ""
@@ -415,6 +486,14 @@ class LlamaServer:
     def _start_server(self):
         """Start the llama.cpp server and wait until it's ready."""
         # Determine the server path
+        if self.server_path is None and shared.args.llama_server_path:
+            if shared.args.ik:
+                raise ValueError("--llama-server-path cannot be combined with --ik")
+            custom_path = Path(shared.args.llama_server_path).expanduser().resolve()
+            if not custom_path.is_file():
+                raise FileNotFoundError(f"Custom llama-server executable not found: {custom_path}")
+            self.server_path = str(custom_path)
+
         if self.server_path is None:
             if shared.args.ik:
                 try:
@@ -426,6 +505,8 @@ class LlamaServer:
             else:
                 import llama_cpp_binaries
                 self.server_path = llama_cpp_binaries.get_binary_path()
+
+        logger.info(f"llama.cpp executable: {self.server_path}")
 
         # Build the command
         cmd = [

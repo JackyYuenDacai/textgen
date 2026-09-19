@@ -112,6 +112,7 @@ group.add_argument('--threads-batch', type=int, default=0, help='Number of threa
 group.add_argument('--numa', action='store_true', help='Activate NUMA task allocation for llama.cpp.')
 group.add_argument('--parallel', type=int, default=1, help='Number of parallel request slots. The context size is divided equally among slots. For example, to have 4 slots with 8192 context each, set ctx_size to 32768.')
 group.add_argument('--fit-target', type=str, default='512', help='Target VRAM margin per device for auto GPU layers, comma-separated list of values in MiB. A single value is broadcast across all devices.')
+group.add_argument('--llama-server-path', type=str, default=None, help='Path to a custom llama-server executable. Cannot be combined with --ik.')
 group.add_argument('--extra-flags', type=str, default=None, help='Extra flags to pass to llama-server. Example: "--jinja --rpc 192.168.1.100:50052"')
 group.add_argument('--ik', action='store_true', help='Use ik_llama.cpp instead of upstream llama.cpp. Requires the ik_llama_cpp_binaries package to be installed.')
 
